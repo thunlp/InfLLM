@@ -1,0 +1,12 @@
+model:
+  type: infinite-lm
+  path: lmsys/vicuna-7b-v1.5
+  n_init: 128
+  n_local: 3968
+  fattn: true
+  base: 10000
+  distance_scale: 1.0
+
+max_len: 2147483647
+chunk_size: 8192
+conv_type: vicuna

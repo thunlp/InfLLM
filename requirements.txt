@@ -1,0 +1,17 @@
+torch>=1.13.1
+transformers>=4.37.2
+fschat>=0.2.35
+datasets>=2.17.0
+omegaconf
+
+# flash-attn
+
+# model-center>=1.0.3
+
+# We tested triton-nightly-2.1.0.dev20231014192330 on A100/A800
+# pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly==2.1.0.dev20231014192330
+
+# for benchmark
+# rouge==1.0.1
+# fuzzywuzzy==0.18.0
+# jieba==0.42.1

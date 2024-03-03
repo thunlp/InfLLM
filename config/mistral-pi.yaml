@@ -1,0 +1,11 @@
+model:
+  type: origin
+  path: mistralai/Mistral-7B-Instruct-v0.2
+  base: 1000000
+  distance_scale: 0.25
+  fattn: true
+
+max_len: 131072
+chunk_size: 8192
+conv_type: mistral-inst
+truncation: suffix

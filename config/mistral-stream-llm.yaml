@@ -1,0 +1,12 @@
+model:
+  type: stream-llm
+  path: mistralai/Mistral-7B-Instruct-v0.2
+  n_init: 128
+  n_local: 6144
+  fattn: true
+  base: 1000000
+  distance_scale: 1.0
+
+max_len: 2147483647
+chunk_size: 8192
+conv_type: mistral-inst

@@ -1,0 +1,11 @@
+model:
+  type: origin
+  path: lmsys/vicuna-7b-v1.5
+  base: 10000
+  distance_scale: 1.0
+  fattn: true
+
+max_len: 4096
+chunk_size: 4096
+conv_type: vicuna
+truncation: suffix

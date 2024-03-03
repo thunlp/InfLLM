@@ -1,0 +1,18 @@
+model:
+  type: inf-llm
+  path: mistralai/Mistral-7B-Instruct-v0.2
+  block_size: 128
+  n_init: 128
+  n_local: 4096
+  topk: 64
+  repr_topk: 4
+  max_cached_block: 32
+  exc_block_size: 512
+  score_decay: 0.1
+  fattn: true
+  base: 1000000
+  distance_scale: 1.0
+
+max_len: 2147483647
+chunk_size: 8192
+conv_type: mistral-inst
