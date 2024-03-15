@@ -21,12 +21,13 @@ import triton.language as tl
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, 
-                    K_block_ptr, V_block_ptr, MASK_block_ptr, 
+                    K_block_ptr, V_block_ptr, MASK_block_ptr, Logits_block_ptr,
                     start_m, qk_scale,  
                     N_CTX,
                     sliding_window_offset, sliding_window_size,
                     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, SLIDING_WINDOW: tl.constexpr,
                     IS_EVEN_M: tl.constexpr, IS_EVEN_N: tl.constexpr, 
+                    OUTPUT_LOGITS: tl.constexpr
                 ):
     # range of values handled by this stage
     if SLIDING_WINDOW:
@@ -44,6 +45,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
         K_block_ptr = tl.advance(K_block_ptr, (0, lo))
         V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
         MASK_block_ptr = tl.advance(MASK_block_ptr, (0, lo))
+        if OUTPUT_LOGITS:
+            Logits_block_ptr = tl.advance(Logits_block_ptr, (0, lo))
     else:
         lo, hi = 0, N_CTX
     # loop over k, v and update accumulator
@@ -64,6 +67,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
         qk += tl.dot(q, k) 
         qk = qk * qk_scale
         qk = tl.where(mask, qk, float("-inf"))
+        if OUTPUT_LOGITS:
+            if IS_EVEN_N and IS_EVEN_M:
+                tl.store(Logits_block_ptr, qk.to(k.dtype))
+            else:
+                tl.store(Logits_block_ptr, qk.to(k.dtype), boundary_check=(0,1))
+   
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
@@ -89,6 +98,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         MASK_block_ptr = tl.advance(MASK_block_ptr, (0, BLOCK_N))
+        if OUTPUT_LOGITS:
+            Logits_block_ptr = tl.advance(Logits_block_ptr, (0, BLOCK_N))
 
     return acc, l_i, m_i
 
@@ -100,12 +111,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
     }
 )
 @triton.jit
-def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
+def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, Logits,#
               stride_qz, stride_qh, stride_qm, stride_qk,  #
               stride_kz, stride_kh, stride_kn, stride_kk,  #
               stride_vz, stride_vh, stride_vk, stride_vn,  #
               stride_maskz, stride_maskh, stride_maskm, stride_maskk,
               stride_oz, stride_oh, stride_om, stride_on,  #
+              stride_logitsz, stride_logitsh, stride_logitsm, stride_logitsn,
               Z, H,  #
               N_CTX,  #
               ROUND_CTX,
@@ -119,7 +131,8 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
               BLOCK_N: tl.constexpr,  #
               END: tl.constexpr,
               INIT: tl.constexpr,
-              SLIDING_WINDOW: tl.constexpr
+              SLIDING_WINDOW: tl.constexpr,
+              OUTPUT_LOGITS: tl.constexpr
             ):
 
     start_m = tl.program_id(0)
@@ -132,6 +145,7 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
     o_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
     # qvk_offset = off_z * stride_qz + off_h * stride_qh
     mask_offset = off_z.to(tl.int64) * stride_maskz + off_h.to(tl.int64) * stride_maskh
+    logits_offset = off_z.to(tl.int64) * stride_logitsz + off_h.to(tl.int64) * stride_logitsh
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
@@ -174,6 +188,17 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0),
     )
+    if OUTPUT_LOGITS:
+        Logits_block_ptr = tl.make_block_ptr(
+            base = Logits + logits_offset,
+            shape = (N_CTX, NKV_CTX),
+            strides = (stride_logitsm, stride_logitsn),
+            offsets = (start_m * BLOCK_M, 0),
+            block_shape = (BLOCK_M, BLOCK_N),
+            order=(1, 0)
+        )
+    else:
+        Logits_block_ptr = None
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # initialize pointer to m and l
@@ -197,10 +222,10 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
     else:
         q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr, MASK_block_ptr, #
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr, MASK_block_ptr, Logits_block_ptr, #
                                     start_m, qk_scale, NKV_CTX, #
                                     sliding_window_offset, sliding_window_size,
-                                    BLOCK_M, BLOCK_DMODEL, BLOCK_N, SLIDING_WINDOW, IS_EVEN_M, IS_EVEN_N) 
+                                    BLOCK_M, BLOCK_DMODEL, BLOCK_N, SLIDING_WINDOW, IS_EVEN_M, IS_EVEN_N, OUTPUT_LOGITS) 
     # epilogue
     if (END):
         m_i += tl.math.log2(l_i)
@@ -212,7 +237,7 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, #
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
-def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False, sliding_window=None):
+def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False, sliding_window=None, output_logits=False):
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     
     assert Lq == Lk and Lk == Lv
@@ -233,6 +258,22 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
         l = torch.empty(l_shape, device=q.device, dtype=torch.float32)
         init = True
 
+    if output_logits:
+        logits = torch.empty(
+            mask.shape,
+            dtype=q.dtype,
+            device=q.device
+        )
+        logits_strides = (
+            logits.stride(0),
+            logits.stride(1),
+            logits.stride(2),
+            logits.stride(3)
+        )
+    else:
+        logits = None
+        logits_strides = (0, 0, 0, 0)
+
     
     if sliding_window is not None:
         sliding_window_offset, sliding_window_size = sliding_window
@@ -244,12 +285,13 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
         q.shape[0] * q.shape[1],
     )
     _attn_fwd[grid](
-        q, k, v, mask, sm_scale, m, o, l, #
+        q, k, v, mask, sm_scale, m, o, l, logits, #
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
         mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+        *logits_strides,
         q.shape[0], q.shape[1],  #
         q.shape[2],  #
         q_round_len,
@@ -262,6 +304,7 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         SLIDING_WINDOW=(sliding_window is not None),
+        OUTPUT_LOGITS=output_logits,
         num_warps=4,
         num_stages=4
     )
@@ -269,7 +312,7 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
     if end:
         o = o[:, :, :q.shape[2], :].contiguous().to(q.dtype)
 
-    return o, m, l
+    return o, m, l, logits
 
 
 class _attention(torch.autograd.Function):
@@ -278,7 +321,7 @@ class _attention(torch.autograd.Function):
     def forward(
         ctx, q1, k1, v1, mask1, q2, k2, v2, mask2, sm_scale = None, 
         sliding_window1=None, sliding_window2=None, 
-        output_M: bool = False,
+        output_M: bool = False, output_logits1=False, output_logits2=False
     ):
 
         q1 = q1.contiguous()
@@ -309,14 +352,14 @@ class _attention(torch.autograd.Function):
         KV2_CTX = k2.shape[-2]
         mask1 = mask1.expand((BATCH, N_HEAD, N_CTX, KV1_CTX))
         mask2 = mask2.expand((BATCH, N_HEAD, N_CTX, KV2_CTX))
-        o, m, l = _forward(q1, k1, v1, mask1, sm_scale, sliding_window=sliding_window1)
-        o, m, l = _forward(q2, k2, v2, mask2, sm_scale, o, m, l, end=True, sliding_window=sliding_window2)
+        o, m, l, logits1 = _forward(q1, k1, v1, mask1, sm_scale, sliding_window=sliding_window1, output_logits=output_logits1)
+        o, m, l, logits2 = _forward(q2, k2, v2, mask2, sm_scale, o, m, l, end=True, sliding_window=sliding_window2, output_logits=output_logits2)
 
         # ctx.save_for_backward(q1, k1, v1, mask1, q2, k2, v2, mask2, o, m)
         # ctx.sm_scale = sm_scale
 
         if output_M:
-            return o, m[:, :, :N_CTX]
+            return o, m[:, :, :N_CTX], logits1, logits2
 
         return o
 
@@ -343,6 +386,8 @@ def mq_attn_triton(
     casual1: Optional[bool] = False,
     casual2: Optional[bool] = False,
     output_M: bool = False,
+    output_logits1: bool = False,
+    output_logits2: bool = False
 ) -> torch.FloatTensor:
     if casual1:
         assert sliding_window1 is None
@@ -363,7 +408,7 @@ def mq_attn_triton(
 
     return _attention.apply(
         q1, k1, v1, mask1, q2, k2, v2, mask2, sm_scale, sliding_window1, sliding_window2,
-        output_M
+        output_M, output_logits1, output_logits2
     )
 
 if __name__ == "__main__":
@@ -408,8 +453,6 @@ if __name__ == "__main__":
         dist = torch.arange(0, Q_LEN, dtype=torch.int64, device='cuda')[:, None] - torch.arange(0, KV2_LEN, dtype=torch.int64, device='cuda')[None, :] + (KV2_LEN - Q_LEN)
         mask2 &= ((dist >= 0) & (dist < sliding_window_size2))[None, None, :, :]
 
-    training = True
-    
 
     def do_bench(*, fn, warmup = 5, repeat = 5, **kwargs):
         for _ in range(warmup):
