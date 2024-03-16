@@ -1,9 +1,10 @@
 import torch
-from .utils import repeat_kv, get_mq_attn
+from .utils import repeat_kv
+from .dot_production_attention import get_multi_stage_dot_production_attention
 
 
 def infinite_lm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
-    mq_attn, _ = get_mq_attn(fattn)
+    Attn, _ = get_multi_stage_dot_production_attention(fattn)
     def forward(self, query : torch.Tensor,
                     key_value : torch.Tensor,
                     position_bias : torch.Tensor,
@@ -103,13 +104,10 @@ def infinite_lm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
                 dtype=h_v.dtype
             )
 
-
-
-        score = mq_attn(
-            local_h_q, local_h_k, local_h_v, local_mask,
-            init_h_q, init_h_k, init_h_v, init_mask,
-            sliding_window1=n_local
-        )
+        attn = Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
+        attn.append(local_h_q, local_h_k, local_h_v, local_mask, sliding_window=n_local)
+        attn.append(init_h_q, init_h_k, init_h_v, init_mask, end=True)
+        score, _ = attn.get_result()
 
         score = score.view(batch_size, num_heads, len_q, dim_head).permute(0, 2, 1, 3) # (batch, len_q, num_heads, dim_head)
         score = score.reshape(batch_size, len_q, num_heads * dim_head) # (batch, len_q, num_heads * dim_head)

@@ -1,4 +1,3 @@
-# https://github.com/openai/triton/blob/main/python/tutorials/06-fused-attention.py
 """
 Fused Attention
 ===============
@@ -17,6 +16,7 @@ import torch
 
 import triton
 import triton.language as tl
+from .base import MultiStageDotProductionAttention
 
 
 @triton.jit
@@ -237,26 +237,16 @@ def _attn_fwd(Q, K, V, MASK, sm_scale, M, Out, L, Logits,#
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
-def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False, sliding_window=None, output_logits=False):
+def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False, sliding_window=None, output_logits=False, init=False):
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
     assert mask.dtype in [torch.bool]
-    init = False
 
     BLOCK_M = 64
     BLOCK_N = 64
     q_round_len = math.ceil(q.shape[2] / 128) * 128
-    o_shape = (q.shape[0], q.shape[1], q_round_len, q.shape[3])
-    m_shape = (q.shape[0], q.shape[1], q_round_len)
-    l_shape = (q.shape[0], q.shape[1], q_round_len)
-
-    if o is None:
-        o = torch.empty(o_shape, device=q.device, dtype=q.dtype)
-        m = torch.empty(m_shape, device=q.device, dtype=torch.float32)
-        l = torch.empty(l_shape, device=q.device, dtype=torch.float32)
-        init = True
 
     if output_logits:
         logits = torch.empty(
@@ -274,7 +264,7 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
         logits = None
         logits_strides = (0, 0, 0, 0)
 
-    
+
     if sliding_window is not None:
         sliding_window_offset, sliding_window_size = sliding_window
     else:
@@ -315,194 +305,81 @@ def _forward(q, k, v, mask, sm_scale, o = None, m = None, l = None, end = False,
     return o, m, l, logits
 
 
-class _attention(torch.autograd.Function):
 
-    @staticmethod
-    def forward(
-        ctx, q1, k1, v1, mask1, q2, k2, v2, mask2, sm_scale = None, 
-        sliding_window1=None, sliding_window2=None, 
-        output_M: bool = False, output_logits1=False, output_logits2=False
-    ):
+class TritonMultiStageDotProductionAttention(MultiStageDotProductionAttention):
+    def __init__(self, q_shape, dtype, device):
+        self.q_shape = q_shape
+        self.dtype = dtype
+        self.device = device
+        q_round_len = math.ceil(q_shape[2] / 128) * 128
+        o_shape = (q_shape[0], q_shape[1], q_round_len, q_shape[3])
+        m_shape = (q_shape[0], q_shape[1], q_round_len)
+        l_shape = (q_shape[0], q_shape[1], q_round_len)
 
-        q1 = q1.contiguous()
-        k1 = k1.contiguous()
-        v1 = v1.contiguous()
-        mask1 = mask1.contiguous()
-        q2 = q2.contiguous()
-        k2 = k2.contiguous()
-        v2 = v2.contiguous()
-        mask2 = mask2.contiguous()
+        self.o = torch.empty(o_shape, device=device, dtype=torch.float32)
+        self.m = torch.empty(m_shape, device=device, dtype=torch.float32)
+        self.l = torch.empty(l_shape, device=device, dtype=torch.float32)
+        self.mask_list = []
+        self.logits_list = []
+        self.score_list = []
+        self.end = False
+        self.init = False
 
-        m1_shape = mask1.shape
-        m2_shape = mask2.shape
-        assert len(m1_shape) <= 4
-        assert len(m2_shape) <= 4
-        m1_shape = [1] * (4-len(m1_shape)) + list(m1_shape)
-        m2_shape = [1] * (4-len(m2_shape)) + list(m2_shape)
-        mask1 = mask1.view(m1_shape)
-        mask2 = mask2.view(m2_shape)
+    def finalize(self):
+        self.end = True
+        for logits, mask in zip(self.logits_list, self.mask_list):
+            if logits is not None:
+                if self.m.size(-1) != self.q_shape[-2]:
+                    self.m = self.m[:, :, :self.q_shape[-2]]
+                logits.sub_(self.m[:, :, :, None])
+                logits.exp2_()
+                logits.masked_fill_(
+                    mask == False,
+                    0
+                )
+                self.score_list.append(logits)
+            else:
+                self.score_list.append(None)
 
-        assert q1.shape[-2] == q2.shape[-2]
-        if sm_scale is None:
-            import math
-            sm_scale = 1 / math.sqrt(q1.shape[-1])
-
-        BATCH, N_HEAD, N_CTX = q1.shape[:3]
-        KV1_CTX = k1.shape[-2]
-        KV2_CTX = k2.shape[-2]
-        mask1 = mask1.expand((BATCH, N_HEAD, N_CTX, KV1_CTX))
-        mask2 = mask2.expand((BATCH, N_HEAD, N_CTX, KV2_CTX))
-        o, m, l, logits1 = _forward(q1, k1, v1, mask1, sm_scale, sliding_window=sliding_window1, output_logits=output_logits1)
-        o, m, l, logits2 = _forward(q2, k2, v2, mask2, sm_scale, o, m, l, end=True, sliding_window=sliding_window2, output_logits=output_logits2)
-
-        # ctx.save_for_backward(q1, k1, v1, mask1, q2, k2, v2, mask2, o, m)
-        # ctx.sm_scale = sm_scale
-
-        if output_M:
-            return o, m[:, :, :N_CTX], logits1, logits2
-
-        return o
-
-    @staticmethod
-    def backward(ctx, do, *args, **kwargs):
-
-        raise NotImplementedError
+        self.ret = self.o
 
 
-from typing import Optional, Tuple, Union
 
-def mq_attn_triton(
-    q1: torch.FloatTensor,
-    k1: torch.FloatTensor,
-    v1: torch.FloatTensor,
-    mask1: torch.BoolTensor,
-    q2: torch.FloatTensor,
-    k2: torch.FloatTensor,
-    v2: torch.FloatTensor,
-    mask2: torch.BoolTensor,
-    sm_scale: Optional[float] = None,
-    sliding_window1: Optional[Union[Tuple[int, int], int]] = None, 
-    sliding_window2: Optional[Union[Tuple[int, int], int]] = None,
-    casual1: Optional[bool] = False,
-    casual2: Optional[bool] = False,
-    output_M: bool = False,
-    output_logits1: bool = False,
-    output_logits2: bool = False
-) -> torch.FloatTensor:
-    if casual1:
-        assert sliding_window1 is None
-        sliding_window1 = (k1.shape[2] - q1.shape[2], k1.shape[2])
-    if casual2:
-        assert sliding_window2 is None
-        sliding_window2 = (k2.shape[2] - q2.shape[2], k2.shape[2])
+    def append(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, end=False, get_score=False, casual = False, sliding_window = None):
+        assert q.shape == self.q_shape
+        if casual:
+            assert sliding_window is None
+            sliding_window = (k.shape[2] - q.shape[2], k.shape[2])
 
-    if isinstance(sliding_window1, int):
-        sliding_window1 = (
-            k1.shape[2] - q1.shape[2], sliding_window1
-        )
+        if isinstance(sliding_window, int):
+            sliding_window = (
+                k.shape[2] - q.shape[2], sliding_window
+            )
 
-    if isinstance(sliding_window2, int):
-        sliding_window2 = (
-            k2.shape[2] - q2.shape[2], sliding_window2
-        )
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        mask = mask.contiguous()
+        mask_shape = [1] * (4-mask.dim()) + list(mask.shape)
+        mask = mask.view(mask_shape)
+        
+        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        KV_CTX = k.shape[-2]
+        mask = mask.expand((BATCH, N_HEAD, N_CTX, KV_CTX))
+        sm_scale = 1 / math.sqrt(q.shape[-1])
+        o, m, l, logits = _forward(q, k, v, mask, sm_scale, self.o, self.m, self.l, sliding_window=sliding_window, output_logits=get_score, end=end, init=not self.init)
+        self.init = True
+        self.o = o
+        self.m = m
+        self.l = l
+        if get_score:
+            self.mask_list.append(mask)
+            self.logits_list.append(logits)
+        else:
+            self.mask_list.append(None)
+            self.logits_list.append(None)
 
-    return _attention.apply(
-        q1, k1, v1, mask1, q2, k2, v2, mask2, sm_scale, sliding_window1, sliding_window2,
-        output_M, output_logits1, output_logits2
-    )
+        if end:
+            assert not self.end 
+            self.finalize()
 
-if __name__ == "__main__":
-    Q_LEN = 512
-    KV1_LEN = 512
-    KV2_LEN = 0
-    DIM = 128
-    HD = 32
-    BT = 1
-
-    sliding_window_size1 = 8192
-    sliding_window_size2 = 8192
-    casual1 = False
-    casual2 = False
-
-    if casual1:
-        assert sliding_window_size1 is None
-        sliding_window_size1 = KV1_LEN
-    if casual2:
-        assert sliding_window_size2 is None
-        sliding_window_size2 = KV2_LEN
-
-    dtype = torch.bfloat16
-    q1 = torch.randn((BT, HD, Q_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True)
-    q2 = torch.randn((BT, HD, Q_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True)
-
-    k1 = torch.randn((BT, HD, KV1_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True)
-    k2 = torch.randn((BT, HD, KV2_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True)
-
-    v1 = torch.randn((BT, HD, KV1_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True) 
-    v2 = torch.randn((BT, HD, KV2_LEN, DIM), dtype=dtype, device='cuda', requires_grad=True)
-
-    mask1 = torch.randint(0, 2, (BT, HD, Q_LEN, KV1_LEN), dtype=torch.bool, device='cuda')
-    mask1 = mask1 | (~mask1)
-    if sliding_window_size1 is not None:
-        dist = torch.arange(0, Q_LEN, dtype=torch.int64, device='cuda')[:, None] - torch.arange(0, KV1_LEN, dtype=torch.int64, device='cuda')[None, :] + (KV1_LEN - Q_LEN)
-        mask1 &= ((dist >= 0) & (dist < sliding_window_size1))[None, None, :, :]
-
-    mask2 = torch.randint(0, 2, (BT, HD, Q_LEN, KV2_LEN), dtype=torch.bool, device='cuda')
-    mask2 = mask2 | (~mask2)
-    if sliding_window_size2 is not None:
-        dist = torch.arange(0, Q_LEN, dtype=torch.int64, device='cuda')[:, None] - torch.arange(0, KV2_LEN, dtype=torch.int64, device='cuda')[None, :] + (KV2_LEN - Q_LEN)
-        mask2 &= ((dist >= 0) & (dist < sliding_window_size2))[None, None, :, :]
-
-
-    def do_bench(*, fn, warmup = 5, repeat = 5, **kwargs):
-        for _ in range(warmup):
-            ret = fn(**kwargs)
-        tl = 0
-        for _ in range(repeat):
-            _st = time.time()
-            torch.cuda.synchronize()
-            ret = fn(**kwargs)
-            torch.cuda.synchronize()
-            tl += time.time() - _st
-        return ret, tl / repeat
-
-
-    import time
-    fwd_args = {
-        "q1": q1,
-        "k1": k1,
-        "v1": v1,
-        "mask1": mask1,
-        "q2": q2,
-        "k2": k2,
-        "v2": v2,
-        "mask2": mask2,
-    }
-    if sliding_window_size1 is not None:
-        sliding_window1 = sliding_window_size1
-    else:
-        sliding_window1 = None
-
-    if sliding_window_size2 is not None:
-        sliding_window2 = sliding_window_size2
-    else:
-        sliding_window2 = None
-
-
-    ret, tm = do_bench(fn = mq_attn_triton, sliding_window1=sliding_window1, sliding_window2=sliding_window2, **fwd_args)
-    print("fattn:")
-    print(" - fwd:", tm)
-    if sliding_window2 is not None or sliding_window1 is not None:
-        ret2, tm = do_bench(fn = mq_attn_triton, **fwd_args)
-        print(" - no sliding window fwd:", tm)
-        print(" - sliding window error: ", (ret- ret2).abs().max().item())
-
-
-    from mq_attn_torch import mq_attn_torch
-    torch_impl = mq_attn_torch
-    tret, tm = do_bench(fn=torch_impl, **fwd_args)
-    print("")
-    print("torch:")
-    print(" - fwd:", tm)
-
-    print(((ret - tret).abs()).max())

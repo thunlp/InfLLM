@@ -12,6 +12,9 @@ def inf_llm_forward(
     use_buffer=True,
     cache_strategy="lru",
     calc_block_score=False,
+    ignore_remainder=False,
+    chunk_topk_calc=None,
+    async_global_stream=False,
     *args, **kwargs
 ):
 
@@ -48,7 +51,9 @@ def inf_llm_forward(
                 exc_block_size, perhead,
                 score_decay, fattn, repr_topk,
                 max_calc_block, use_buffer,
-                cache_strategy, calc_block_score
+                cache_strategy, calc_block_score,
+                ignore_remainder, chunk_topk_calc,
+                async_global_stream
             )
 
 
