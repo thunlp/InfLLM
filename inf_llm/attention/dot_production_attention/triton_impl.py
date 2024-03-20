@@ -18,6 +18,8 @@ import triton
 import triton.language as tl
 from .base import MultiStageDotProductionAttention
 
+_BLOCK_N=64
+_BLOCK_M=64
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, 
@@ -354,23 +356,47 @@ def get_score(q, k, m, sliding_window, complement_sliding_window):
         k.shape[0] * k.shape[1]
     )
     sm_scale = 1 / math.sqrt(q.size(-1))
-    BLOCK_N = 32
-    BLOCK_M = 32
-    _score_kernel[grid](
-        q, k, m, sm_scale, ret,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        ret.stride(0), ret.stride(1), ret.stride(2),
-        q.size(0), q.size(1),
-        N_CTX, ROUND_CTX, NKV_CTX,
-        sliding_window_offset,
-        sliding_window_size,
-        SLIDING_WINDOW=(sliding_window is not None),
-        COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=q.size(-1)
-    )
+
+    global _BLOCK_N
+    global _BLOCK_M
+
+    try:
+        _score_kernel[grid](
+            q, k, m, sm_scale, ret,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            ret.stride(0), ret.stride(1), ret.stride(2),
+            q.size(0), q.size(1),
+            N_CTX, ROUND_CTX, NKV_CTX,
+            sliding_window_offset,
+            sliding_window_size,
+            SLIDING_WINDOW=(sliding_window is not None),
+            COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            BLOCK_DMODEL=q.size(-1)
+        )
+    except triton.OutOfResources as E:
+        from warnings import warn
+        _BLOCK_N = _BLOCK_N // 2
+        _BLOCK_M = _BLOCK_M // 2
+        warn(f"Triton Attention Output Resources. {E}\nUse smaller block size {_BLOCK_N}.")
+        _score_kernel[grid](
+            q, k, m, sm_scale, ret,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            ret.stride(0), ret.stride(1), ret.stride(2),
+            q.size(0), q.size(1),
+            N_CTX, ROUND_CTX, NKV_CTX,
+            sliding_window_offset,
+            sliding_window_size,
+            SLIDING_WINDOW=(sliding_window is not None),
+            COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            BLOCK_DMODEL=q.size(-1)
+        )
+
     return ret
 
 def _forward(
@@ -384,8 +410,6 @@ def _forward(
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
 
-    BLOCK_M = 32
-    BLOCK_N = 32
     q_round_len = math.ceil(q.shape[2] / 64) * 64
 
     if sliding_window is not None:
@@ -397,28 +421,61 @@ def _forward(
         triton.cdiv(q.shape[2], META["BLOCK_M"]),
         q.shape[0] * q.shape[1],
     )
-    _attn_fwd[grid](
-        q, k, v, sm_scale, m, o, l, #
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
-        q.shape[0], q.shape[1],  #
-        q.shape[2],  #
-        q_round_len,
-        k.shape[2],
-        sliding_window_offset,
-        sliding_window_size,
-        BLOCK_DMODEL=Lk,  #
-        END=end,
-        INIT=init,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        SLIDING_WINDOW=(sliding_window is not None),
-        COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
-        num_warps=4,
-        num_stages=4
-    )
+
+    global _BLOCK_N
+    global _BLOCK_M
+
+    try:
+        _attn_fwd[grid](
+            q, k, v, sm_scale, m, o, l, #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            q.shape[0], q.shape[1],  #
+            q.shape[2],  #
+            q_round_len,
+            k.shape[2],
+            sliding_window_offset,
+            sliding_window_size,
+            BLOCK_DMODEL=Lk,  #
+            END=end,
+            INIT=init,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            SLIDING_WINDOW=(sliding_window is not None),
+            COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
+            num_warps=4,
+            num_stages=4
+        )
+    except triton.OutOfResources as E:
+        _BLOCK_N = _BLOCK_N // 2
+        _BLOCK_M = _BLOCK_M // 2
+        from warnings import warn
+        warn(f"Triton Attention Output Resources. {E}\nUse smaller block size {_BLOCK_N}.")
+        _attn_fwd[grid](
+            q, k, v, sm_scale, m, o, l, #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            q.shape[0], q.shape[1],  #
+            q.shape[2],  #
+            q_round_len,
+            k.shape[2],
+            sliding_window_offset,
+            sliding_window_size,
+            BLOCK_DMODEL=Lk,  #
+            END=end,
+            INIT=init,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            SLIDING_WINDOW=(sliding_window is not None),
+            COMPLEMENT_SLIDING_WINDOW=complement_sliding_window,
+            num_warps=4,
+            num_stages=4
+        )
+
 
     if end:
         o = o[:, :, :q.shape[2], :].contiguous().to(q.dtype)
