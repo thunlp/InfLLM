@@ -67,9 +67,8 @@ def infinite_lm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
         local_h_v = h_v_
 
         if len_k > n_local:
-            init_h_q = position_bias.apply_rotary_pos_emb(
-                h_q,
-                1, n_local, position_bias._cos_cached, position_bias._sin_cached
+            init_h_q = position_bias.apply_rotary_pos_emb_one_angle(
+                h_q, n_local
             )
             init_h_k = h_k
             init_h_v = h_v
@@ -96,7 +95,7 @@ def infinite_lm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
 
         attn = Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
         attn.append(local_h_q, local_h_k, local_h_v, sliding_window=n_local)
-        attn.append(init_h_q, init_h_k, init_h_k, end=True, sliding_window=(len_k - len_q, n_local), complement_sliding_window=True)
+        attn.append(init_h_q, init_h_k, init_h_v, end=True, sliding_window=(len_k - len_q, n_local), complement_sliding_window=True)
         score, _ = attn.get_result()
 
         score = score.view(batch_size, num_heads, len_q, dim_head).permute(0, 2, 1, 3) # (batch, len_q, num_heads, dim_head)
