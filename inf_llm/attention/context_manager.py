@@ -565,16 +565,16 @@ class ContextManager:
 
 
         block_k = self.block_k.get_data()
-        assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block * self.repr_topk, self.dim_head)
+        assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
 
         global_repr_logits = torch.matmul(
             global_h_q, block_k.transpose(-1, -2)
-        ) # (num_units, unit_size, len_q, num_global_block * repr_topk)
+        ) # (num_units, unit_size, len_q, num_global_block)
 
-        assert global_repr_logits.shape == (self.num_units, self.unit_size, length, self.num_global_block * self.repr_topk)
+        assert global_repr_logits.shape == (self.num_units, self.unit_size, length, self.num_global_block)
 
-        block_score = global_repr_logits.view(self.num_units, self.unit_size, length, self.num_global_block, self.repr_topk)
-        block_score = block_score.mean(dim=-1).mean(dim=1) 
+        block_score = global_repr_logits.view(self.num_units, self.unit_size, length, self.num_global_block)
+        block_score = block_score.mean(dim=1) 
 
 
         assert block_score.shape == (self.num_units, length, self.num_global_block)
