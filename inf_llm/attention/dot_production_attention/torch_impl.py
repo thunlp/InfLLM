@@ -25,7 +25,7 @@ class TorchMultiStageDotProductionAttention(MultiStageDotProductionAttention):
                 0
             )
             if get_score:
-                self.score_list.append(tmp)
+                self.score_list.append(tmp.sum(dim=-2))
             else:
                 self.score_list.append(None)
 
@@ -38,10 +38,35 @@ class TorchMultiStageDotProductionAttention(MultiStageDotProductionAttention):
 
     def append(
             self, 
-            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, 
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+            sliding_window = None,
+            complement_sliding_window:bool = False,
             end=False, get_score=False,
             *args, **kwargs
         ):
+        len_q = q.size(-2)
+        len_k = k.size(-2)
+
+        if sliding_window is None:
+            mask = torch.ones(
+                (len_q, len_k),
+                dtype=torch.bool,
+                device=q.device
+            )
+        else:
+            if isinstance(sliding_window, int):
+                sliding_window = (len_k - len_q, sliding_window)
+
+            dist = torch.arange(
+                len_q, dtype=torch.int64, device=q.device
+            )[:, None] - torch.arange(
+                len_k, dtype=torch.int64, device=k.device
+            )[None, :] + sliding_window[0]
+            if complement_sliding_window:
+                mask = dist >= sliding_window[1]
+            else:
+                mask = (dist < sliding_window[1]) & (dist >= 0)
+
         m_shape = [1] * (4-mask.dim()) + list(mask.shape)
         mask = mask.view(m_shape)
         self.v_list.append(v)

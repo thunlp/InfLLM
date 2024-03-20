@@ -18,7 +18,8 @@ class MultiStageDotProductionAttention:
 
     def append(
         self, 
-        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, 
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+        sliding_window=None, complement_sliding_window: bool = False,
         end=False, get_score=False,
         *args, **kwargs
     ):

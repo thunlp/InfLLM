@@ -44,7 +44,7 @@ class VectorTensor:
         element_dtype,
         concat_dim,
     ):
-        init_cached_size = 64
+        init_cached_size = 16
         if concat_dim != 0:
             element_shape = (element_shape[concat_dim],) + element_shape[1:concat_dim] + (element_shape[0],)  + element_shape[concat_dim+1:]
         init_data_shape = (init_cached_size,) + element_shape[1:]
@@ -112,7 +112,7 @@ class ContextManager:
                  calc_block_score = False,
                  ignore_remainder: bool = False,
                  chunk_topk_calc: Optional[int] = None,
-                 async_global_stream: bool = False
+                 async_global_stream: bool = True
     ):
         if max_calc_block is None:
             max_calc_block = topk
@@ -316,7 +316,8 @@ class ContextManager:
                     dtype = global_k.dtype, device=global_k.device
                 )
             self.global_buffer_block_id_list = [[-1] * self.max_calc_block for _ in range(self.num_units)]
-            self.global_buffer_init_len = 0
+            self.global_buffer_init_st = 0
+            self.global_buffer_init_ed = 0
 
         self.initialized = True
     
@@ -329,14 +330,17 @@ class ContextManager:
                 return [list(range(len(self.global_blocks[0]))) for _ in range(self.num_units)]
 
             block_k = self.block_k.get_data()
-            assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block * self.repr_topk, self.dim_head)
+            assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
 
-            global_repr_logits = torch.matmul(
+            global_h_q = global_h_q.mean(dim=2, keepdim=True)
+            assert global_h_q.shape == (self.num_units, self.unit_size, 1, self.dim_head)
+
+            block_score = torch.matmul(
                 global_h_q, block_k.transpose(-1, -2)
-            ) # (num_units, unit_size, len_q, num_global_block * repr_topk)
+            ) # (num_units, unit_size, 1, num_global_block * repr_topk)
 
-            block_score = global_repr_logits.view(self.num_units, self.unit_size, -1, self.num_global_block, self.repr_topk)
-            block_score = block_score.mean(dim=-1).mean(dim=2).mean(dim=1) 
+            block_score = block_score.squeeze(dim=2)
+            block_score = block_score.mean(dim=1) 
 
             assert block_score.shape == (self.num_units, self.num_global_block)
             indices = block_score.topk(self.topk, dim=-1).indices.cpu()
@@ -352,20 +356,6 @@ class ContextManager:
         return ret
 
 
-    def get_local_mask(
-        self, local_h_q, local_h_k
-    ):
-        len_q = local_h_q.size(-2)
-        len_k = local_h_k.size(-2)
-        device = local_h_q.device
-        dist = torch.arange(
-            len_q, device=device
-        ).unsqueeze(1) - torch.arange(
-            len_k, device=device
-        ).unsqueeze(0) + len_k - len_q
-        return (dist >= 0) & (dist < self.n_local)
-
-
     def get_global_hidden_and_mask(
         self, len_q, block_topk
     ):
@@ -373,9 +363,10 @@ class ContextManager:
         global_block_map = [[] for _ in range(self.num_units)]
         global_remainder_len = max(self._global_remainder_ed - self._global_remainder_st + len_q - self.n_local, 0)
         init_len = self.init_k.size(-2)
+        sliding_window = None
 
         total_len = self.max_calc_block * self.block_size + self.exc_block_size + self.block_size + self.n_init
-        if self.ignore_remainder:
+        if self.ignore_remainder and self.init_exc:
             total_len -= self.exc_block_size + self.block_size
 
         non_blocking_copy = True
@@ -389,11 +380,6 @@ class ContextManager:
                 device='cuda', dtype=self.dtype
             )
             global_h_v = torch.zeros_like(global_h_k)
-
-        global_mask = torch.ones(
-            (len_q, total_len),
-            device='cuda', dtype=torch.bool
-        )
 
         block_num = None
         for u in range(self.num_units):
@@ -438,47 +424,38 @@ class ContextManager:
                 global_h_v[u, :, st:ed, :].copy_(self.from_group_kv(self.global_blocks[u][b_idx][1].get()), non_blocking=non_blocking_copy)
 
              
-
-
-        global_mask[ :, block_num * self.block_size: self.max_calc_block * self.block_size] = False
-            
-
-        init_st = self.max_calc_block * self.block_size
+        init_st = block_num * self.block_size
         init_ed = init_st + init_len
-        if not self.use_buffer or self.global_buffer_init_len < init_len:
+        if (not self.use_buffer) or self.global_buffer_init_st != init_st or self.global_buffer_init_ed != init_ed:
             global_h_k[:, :, init_st: init_ed, :].copy_(self.init_k, non_blocking=non_blocking_copy)
             global_h_v[:, :, init_st: init_ed, :].copy_(self.init_v, non_blocking=non_blocking_copy)
 
-        global_mask[:, init_ed:] = False
-        
-        if not self.ignore_remainder:
-            rmd_st = total_len - global_remainder_len
-            rmd_ed = total_len
+        ed = init_ed
+
+        if not self.ignore_remainder or init_len < self.n_init:
+            rmd_st = init_ed
+            rmd_ed = rmd_st + global_remainder_len
+            ed = rmd_ed
             global_h_k[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[0][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=non_blocking_copy)
             global_h_v[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[1][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=non_blocking_copy)
 
-            dist = torch.arange(
-                len_q, device='cuda'
-            ).unsqueeze(dim=1) - torch.arange(
-                global_remainder_len,
-                device='cuda'
-            ).unsqueeze(dim=0) + self.global_remainder[0].size(-2)
-            mask = (dist >= self.n_local)
 
-            global_mask[:, rmd_st: rmd_ed].copy_(mask, non_blocking=non_blocking_copy)
+            sliding_window = (self.global_remainder[0].size(-2) + rmd_st, self.n_local)
 
         if self.use_buffer:
             self.global_buffer_block_id_list = deepcopy(global_block_map)
-            self.global_buffer_init_len = init_len
+            self.global_buffer_init_st = init_st
+            self.global_buffer_init_ed = init_ed
 
         for u in range(self.num_units):
             assert max(global_block_map[u][block_num:] + [-1]) == -1
             assert min(global_block_map[u][:block_num] + [0]) > -1
             global_block_map[u] = list(global_block_map[u][:block_num])
 
-        # wait for non-blocking copy
 
-        return global_h_k, global_h_v, global_mask, global_block_map, block_num
+        global_h_k = global_h_k[:, :, :ed, :]
+        global_h_v = global_h_v[:, :, :ed, :]
+        return global_h_k, global_h_v, sliding_window, global_block_map, block_num
 
 
     def update_block_score(
@@ -506,16 +483,15 @@ class ContextManager:
         local_q, local_k, local_v, global_q
     ):
 
-        # get local_h_q, local_h_k, local_h_v, local_mask
+        # get local_h_q, local_h_k, local_h_v
         local_h_q, local_h_k = self.position_embedding(local_q, local_k)
         local_h_v = local_v
-        local_mask = self.get_local_mask(local_h_q, local_h_k)
 
 
         # calc local result first to overlap host-device communication
         attn = self.Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
         attn.append(
-            local_h_q, local_h_k, local_h_v, local_mask,
+            local_h_q, local_h_k, local_h_v, 
             get_score=True, sliding_window=self.n_local
         )
 
@@ -527,18 +503,22 @@ class ContextManager:
                 for i in block_topk[u]:
                     self.load_block(u, i)
 
-
-        # get global_h_k, global_h_v, global_mask
-        #    Beacuse exc_block_size <= n_local, no global_k, global_v used in global part
-        with torch.cuda.stream(GLOBAL_STREAM):
+            # get global_h_k, global_h_v, global_mask
+            #    Beacuse exc_block_size <= n_local, no global_k, global_v used in global part
             global_h_q = global_q
-            global_h_k, global_h_v, global_mask, global_block_map, global_block_num = self.get_global_hidden_and_mask(local_h_q.size(-2), block_topk)
+            global_h_k, global_h_v, global_sliding_window, global_block_map, global_block_num = self.get_global_hidden_and_mask(local_h_q.size(-2), block_topk)
 
         if self.async_global_stream:
             torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
         
         # calc global result
-        attn.append(global_h_q, global_h_k, global_h_v, global_mask, end=True, get_score=self.calc_block_score)
+        attn.append(
+            global_h_q, global_h_k, global_h_v, 
+            end=True, get_score=self.calc_block_score, 
+            sliding_window=global_sliding_window,
+            complement_sliding_window=True
+        )
+
         o, score_list = attn.get_result()
         loc_score = score_list[0]
         glb_score = score_list[1]
@@ -631,7 +611,7 @@ class ContextManager:
         return ret
 
     def append_global(
-        self, exc_length, local_score
+        self, exc_length, kv_length, local_score
     ):
 
         global_remainder_ed = self._global_remainder_ed + exc_length
@@ -639,10 +619,8 @@ class ContextManager:
 
         global_remainder_len = global_remainder_ed - global_remainder_st
 
-        assert local_score.shape[:3] == (self.num_units, self.unit_size, exc_length)
-        local_score = local_score[:, :, :, -exc_length-self.n_local:]
-        assert local_score.size(-1) <= global_remainder_len
-        local_score = local_score.sum(dim=-2)
+        assert local_score.shape[:3] == (self.num_units, self.unit_size, kv_length)
+        local_score = local_score[:, :, -exc_length-self.n_local:]
         self.global_remainder_local_score[:, :, global_remainder_ed-local_score.size(-1):global_remainder_ed].add_(local_score)
         
 
@@ -680,6 +658,7 @@ class ContextManager:
                 self.global_remainder_local_score[:, :, global_remainder_st:global_remainder_st + self.block_size]
             )
             assert global_block_k.shape == (self.num_units, self.unit_size, self.repr_topk, self.dim_head)
+            global_block_k = global_block_k.mean(dim=-2, keepdim=True)
 
             self.num_global_block += 1
             self.block_k.append(global_block_k)
@@ -780,7 +759,7 @@ class ContextManager:
 
             # append global
             with torch.cuda.stream(GLOBAL_STREAM):
-                self.append_global(ed - st, local_score)
+                self.append_global(ed - st, kv_ed - kv_st, local_score)
 
             if use_chunk_topk:
                 self._topk_cur += 1
