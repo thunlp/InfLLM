@@ -103,14 +103,10 @@ class ContextManager:
                  position_embedding,
                  n_init, n_local, 
                  block_size, max_cached_block, topk, exc_block_size, 
-                 perhead = False,
-                 score_decay: float = 0.1, fattn: bool = False,
+                 score_decay: Optional[float] = None, fattn: bool = False,
                  repr_topk: int = 1,
                  max_calc_block: Optional[int] = None,
-                 use_buffer = True,
                  cache_strategy = "lru",
-                 calc_block_score = False,
-                 ignore_remainder: bool = False,
                  chunk_topk_calc: Optional[int] = None,
                  async_global_stream: bool = True
     ):
@@ -132,13 +128,9 @@ class ContextManager:
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
-        self.perhead = perhead
         self.repr_topk = repr_topk
-        self.use_buffer = use_buffer
         self.cache_strategy = cache_strategy
-        self.calc_block_score = calc_block_score
         self.load_count = 0
-        self.ignore_remainder = ignore_remainder
         self.chunk_topk_calc = chunk_topk_calc
         self.async_global_stream = async_global_stream
 
@@ -150,7 +142,9 @@ class ContextManager:
         assert cache_strategy in ["lru", "fifo", "lru-s"]
 
         if cache_strategy == "lru-s":
-            assert calc_block_score, "Block score calcualtion is needed for LRU-S cache strategy."
+            self.calc_block_score = True
+        else:
+            self.calc_block_score = False
 
         
     def load_block(self, b, i):
@@ -224,9 +218,6 @@ class ContextManager:
             raise ValueError
 
     def from_group_kv(self, tensor):
-        if self.perhead:
-            return tensor
-
         assert tensor.dim() == 3
         assert tensor.size(0) == self.num_heads_kv
         if self.num_heads == self.num_heads_kv:
@@ -239,9 +230,6 @@ class ContextManager:
 
             
     def to_group_kv(self, tensor):
-        if self.perhead:
-            return tensor
-
         assert tensor.dim() == 3
         assert tensor.size(0) == self.num_heads
         if self.num_heads == self.num_heads_kv:
@@ -274,12 +262,8 @@ class ContextManager:
         self.num_heads = num_heads
         self.num_heads_kv = num_heads_kv
         self.dim_head = dim_head
-        if self.perhead:
-            self.num_units = batch_size * num_heads
-            self.unit_size = 1
-        else:
-            self.num_units = batch_size
-            self.unit_size = num_heads
+        self.num_units = batch_size
+        self.unit_size = num_heads
 
         self.global_blocks = [[] for _ in range(self.num_units)] # [[(global_k, global_v)]]
         self.cached_blocks = [{} for _ in range(self.num_units)] # [[block_id: block_score]
@@ -307,17 +291,14 @@ class ContextManager:
             self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
         )
 
-        if self.use_buffer:
-            buffer_len = self.max_calc_block * self.block_size + self.exc_block_size + self.block_size + self.n_init
-            if self.ignore_remainder:
-                buffer_len -= self.exc_block_size + self.block_size
-            self.global_buffer = torch.zeros(
-                    (2, self.num_units, self.unit_size, buffer_len , dim_head),
-                    dtype = global_k.dtype, device=global_k.device
-                )
-            self.global_buffer_block_id_list = [[-1] * self.max_calc_block for _ in range(self.num_units)]
-            self.global_buffer_init_st = 0
-            self.global_buffer_init_ed = 0
+        buffer_len = self.max_calc_block * self.block_size + self.exc_block_size + self.block_size + self.n_init
+        self.global_buffer = torch.zeros(
+                (2, self.num_units, self.unit_size, buffer_len , dim_head),
+                dtype = global_k.dtype, device=global_k.device
+            )
+        self.global_buffer_block_id_list = [[-1] * self.max_calc_block for _ in range(self.num_units)]
+        self.global_buffer_init_st = 0
+        self.global_buffer_init_ed = 0
 
         self.initialized = True
     
@@ -365,21 +346,8 @@ class ContextManager:
         init_len = self.init_k.size(-2)
         sliding_window = None
 
-        total_len = self.max_calc_block * self.block_size + self.exc_block_size + self.block_size + self.n_init
-        if self.ignore_remainder and self.init_exc:
-            total_len -= self.exc_block_size + self.block_size
-
-        non_blocking_copy = True
-        
-        if self.use_buffer:
-            global_h_k = self.global_buffer[0]
-            global_h_v = self.global_buffer[1]
-        else:
-            global_h_k = torch.empty(
-                (self.num_units, self.unit_size, total_len, self.dim_head),
-                device='cuda', dtype=self.dtype
-            )
-            global_h_v = torch.zeros_like(global_h_k)
+        global_h_k = self.global_buffer[0]
+        global_h_v = self.global_buffer[1]
 
         block_num = None
         for u in range(self.num_units):
@@ -402,8 +370,7 @@ class ContextManager:
             st = 0
             ed = 0
             global_block_map[u] = [-1] * block_num
-            if self.use_buffer:
-                global_block_map[u] = deepcopy(self.global_buffer_block_id_list[u])
+            global_block_map[u] = deepcopy(self.global_buffer_block_id_list[u])
 
 
             b_idx_list = [block_score[i][0] for i in range(block_num)]
@@ -420,32 +387,30 @@ class ContextManager:
                         global_block_map[u][j] = b_idx
                         break
 
-                global_h_k[u, :, st:ed, :].copy_(self.from_group_kv(self.global_blocks[u][b_idx][0].get()), non_blocking=non_blocking_copy)
-                global_h_v[u, :, st:ed, :].copy_(self.from_group_kv(self.global_blocks[u][b_idx][1].get()), non_blocking=non_blocking_copy)
+                global_h_k[u, :, st:ed, :].copy_(self.from_group_kv(self.global_blocks[u][b_idx][0].get()), non_blocking=True)
+                global_h_v[u, :, st:ed, :].copy_(self.from_group_kv(self.global_blocks[u][b_idx][1].get()), non_blocking=True)
 
              
         init_st = block_num * self.block_size
         init_ed = init_st + init_len
-        if (not self.use_buffer) or self.global_buffer_init_st != init_st or self.global_buffer_init_ed != init_ed:
-            global_h_k[:, :, init_st: init_ed, :].copy_(self.init_k, non_blocking=non_blocking_copy)
-            global_h_v[:, :, init_st: init_ed, :].copy_(self.init_v, non_blocking=non_blocking_copy)
+        if self.global_buffer_init_st != init_st or self.global_buffer_init_ed != init_ed:
+            global_h_k[:, :, init_st: init_ed, :].copy_(self.init_k, non_blocking=True)
+            global_h_v[:, :, init_st: init_ed, :].copy_(self.init_v, non_blocking=True)
 
         ed = init_ed
 
-        if not self.ignore_remainder or init_len < self.n_init:
-            rmd_st = init_ed
-            rmd_ed = rmd_st + global_remainder_len
-            ed = rmd_ed
-            global_h_k[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[0][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=non_blocking_copy)
-            global_h_v[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[1][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=non_blocking_copy)
+        rmd_st = init_ed
+        rmd_ed = rmd_st + global_remainder_len
+        ed = rmd_ed
+        global_h_k[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[0][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=True)
+        global_h_v[:, :, rmd_st: rmd_ed, :].copy_(self.global_remainder[1][:, :, self._global_remainder_st:self._global_remainder_st+global_remainder_len, :], non_blocking=True)
 
 
-            sliding_window = (self.global_remainder[0].size(-2) + rmd_st, self.n_local)
+        sliding_window = (self.global_remainder[0].size(-2) + rmd_st, self.n_local)
 
-        if self.use_buffer:
-            self.global_buffer_block_id_list = deepcopy(global_block_map)
-            self.global_buffer_init_st = init_st
-            self.global_buffer_init_ed = init_ed
+        self.global_buffer_block_id_list = deepcopy(global_block_map)
+        self.global_buffer_init_st = init_st
+        self.global_buffer_init_ed = init_ed
 
         for u in range(self.num_units):
             assert max(global_block_map[u][block_num:] + [-1]) == -1
