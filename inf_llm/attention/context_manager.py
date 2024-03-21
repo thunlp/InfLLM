@@ -567,26 +567,18 @@ class ContextManager:
         block_k = self.block_k.get_data()
         assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
 
-        global_repr_logits = torch.matmul(
-            global_h_q, block_k.transpose(-1, -2)
-        ) # (num_units, unit_size, len_q, num_global_block)
 
-        assert global_repr_logits.shape == (self.num_units, self.unit_size, length, self.num_global_block)
-
-        block_score = global_repr_logits.view(self.num_units, self.unit_size, length, self.num_global_block)
-        block_score = block_score.mean(dim=1) 
-
-
-        assert block_score.shape == (self.num_units, length, self.num_global_block)
-
-        
         if exc_block_num > 0:
-            block_score_exc = block_score[:, :exc_block_num * self.exc_block_size, :]
-            block_score_exc = block_score_exc.reshape(self.num_units, exc_block_num, self.exc_block_size, self.num_global_block)
-            block_score_exc = block_score_exc.mean(dim=2)
+            tmp_global_h_q = global_h_q[:, :, :exc_block_num * self.exc_block_size, :].reshape(
+                self.num_units, self.unit_size, exc_block_num, self.exc_block_size, self.dim_head
+            ).mean(dim=-2)
+            assert tmp_global_h_q.shape == (self.num_units, self.unit_size, exc_block_num, self.dim_head)
+            block_score = torch.matmul(
+                tmp_global_h_q, block_k.transpose(-1, -2)
+            ).mean(dim=1) # (num_units, exc_block_num, num_global_block)
+            assert block_score.shape == (self.num_units, exc_block_num, self.num_global_block)
 
-            assert block_score_exc.shape == (self.num_units, exc_block_num, self.num_global_block)
-            indices = block_score_exc.topk(self.topk, dim=-1).indices.cpu()
+            indices = block_score.topk(self.topk, dim=-1).indices.cpu()
             for b in range(exc_block_num):
                 tmp = []
                 for u in range(self.num_units):
@@ -596,8 +588,15 @@ class ContextManager:
                 ret.append(tmp)
 
         if exc_block_num != exc_num: 
-            block_score = block_score[:, exc_block_num * self.exc_block_size:, :]
-            block_score = block_score.mean(dim=1)
+            tmp_global_h_q = global_h_q[:, :, exc_block_num * self.exc_block_size:, :].reshape(
+                self.num_units, self.unit_size, length - exc_block_num * self.exc_block_size, self.dim_head
+            ).mean(dim=-2, keepdim=True)
+            assert tmp_global_h_q.shape == (self.num_units, self.unit_size, 1, self.dim_head)
+            block_score = torch.matmul(
+                tmp_global_h_q, block_k.transpose(-1, -2)
+            )
+            assert block_score.shape == (self.num_units, self.unit_size, 1, self.num_global_block)
+            block_score = block_score.squeeze(dim=2).mean(dim=1)
             assert block_score.shape == (self.num_units, self.num_global_block)
             indices = block_score.topk(self.topk, dim=-1).indices.cpu()
             tmp = []
