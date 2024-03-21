@@ -39,9 +39,11 @@ def patch_hf(
     **kwargs
 ):
     attn_kwargs.update(kwargs)
-    from transformers import LlamaForCausalLM, MistralForCausalLM
+    # This approach lacks scalability and will be refactored.
+    from transformers import LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM
     from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel, BaseModelOutputWithPast
     from transformers.models.mistral.modeling_mistral import MistralAttention, MistralModel
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2Model
 
     def model_forward(
         self,
@@ -134,8 +136,11 @@ def patch_hf(
     elif isinstance(model, MistralForCausalLM):
         Attention = MistralAttention
         Model = MistralModel
+    elif isinstance(model, Qwen2ForCausalLM):
+        Attention = Qwen2Attention
+        Model = Qwen2Model
     else:
-        raise ValueError("Only supports llama and mistral models.")
+        raise ValueError("Only supports llama, mistral and qwen2 models.")
 
     hf_rope = model.model.layers[0].self_attn.rotary_emb 
     base = base if base is not None else hf_rope.base
