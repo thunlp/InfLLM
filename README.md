@@ -32,6 +32,69 @@ jieba==0.42.1
 
 ## Usage
 
+### Configuration
+
+We use YAML files for configuration, and you can see the configuration files we use for benchmark in the `config/` directory. 
+
+The description of the configuration files is as follows:
+
+```yaml
+model: 
+  # attention type. 
+  # inf-llm/infinite-lm/stream-lm/origin(full attention)
+  type: inf-llm 
+
+  # huggingface or model-center model path
+  path: mistralai/Mistral-7B-Instruct-v0.2 
+
+  # Use flash-attention or not. 
+  # For inf-llm/infinite-lm/stream-llm, we implemented multi-stage flash-attention by OpenAI's triton.
+  fattn: true 
+  
+  # RoPE base and distance_scale
+  base: 1000000
+  distance_scale: 1.0
+
+  # inf-llm/infinite-lm/stream-lm settings
+
+  # Initital tokens as attention sinks
+  n_init: 128   
+  # Local sliding window size
+  n_local: 4096 
+
+  # inf-llm settings
+
+  # Number of memory units to retrieve for attention computation.
+  topk: 16  
+  # The number of top-scoring tokens per memory unit considered as representative elements. 
+  repr_topk: 4 
+  # Maximum number of memory units stored in GPU memory. 
+  max_cached_block: 32
+  # Number of tokens queried at a time as an execution block.
+  # Each execution block retrieves topk memory units once.
+  exc_block_size: 512
+  
+  # The strategy for replacing cached memory units. 
+  # Supported strategies include LRU (Least Recently Used), FIFO (First In, First Out), 
+  # and LRU-S (LRU in our paper).
+  cache_strategy: lru
+
+  # score_decay for LRU-S
+  # score_decay: 0.1
+
+# Model max input length.
+# A truncation will be employed if the input length exceeds.
+max_len: 2147483647
+
+# Chunked input in decoding.
+# To save GPU memory.
+chunk_size: 8192
+
+# Conversation type. 
+# mistral/vicuna
+conv_type: mistral
+```
+
 ### Evaluation
 
 **Data Preparation**
