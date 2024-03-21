@@ -64,20 +64,23 @@ class RotaryEmbeddingESM(torch.nn.Module):
                 self._sin_cached = emb.sin()[None, None, :, :]
         return self._cos_cached, self._sin_cached
 
-    def _update_cos_sin_tables_len(self, seq_len, device):
+    def _update_cos_sin_tables_len(self, seq_len, device, dim = None):
         if seq_len > self._seq_len_cached:
-            assert self._cos_cached is not None
+            if dim is None:
+                assert self._cos_cached is not None
+                dim = self._cos_cached.dim()
+
             self._seq_len_cached = seq_len
             t = torch.arange(seq_len, device = device).type_as(self.inv_freq)
             freqs = torch.outer(t * self.distance_scale, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim = -1)
-            if self._cos_cached.dim() == 2:
+            if dim == 2:
                 self._cos_cached = emb.cos()
                 self._sin_cached = emb.sin()
-            elif self._cos_cached.dim() == 3:
+            elif dim == 3:
                 self._cos_cached = emb.cos()[None, :, :]
                 self._sin_cached = emb.sin()[None, :, :]
-            elif self._cos_cached.dim() == 4:
+            elif dim == 4:
                 self._cos_cached = emb.cos()[None, None, :, :]
                 self._sin_cached = emb.sin()[None, None, :, :]
 

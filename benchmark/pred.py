@@ -59,7 +59,7 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[0], prompt)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
-    elif model_name == "mistral-inst":
+    elif model_name in ["mistral-inst", "qwen"]:
         messages = [
             {
                 "role": "user",
@@ -184,6 +184,8 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
     preds = []
     data = list(data)
     searcher = GreedySearch(model, tokenizer)
+    cur = 0
+    total = len(data)
 
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
@@ -239,6 +241,13 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
         pred = output[0]
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "token_length": len(tokenized_prompt) + max_gen})
         searcher.clear()
+        cur += 1
+        print(f"----------{cur}/{total}----------")
+        print("Question:", prompt[-100:])
+        print("Pred:", pred)
+        print("Answer:", json_obj["answers"])
+        print("")
+
 
     return preds
 

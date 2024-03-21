@@ -4,6 +4,7 @@ import re
 import string
 from collections import Counter
 import random
+from typing import Tuple, List
 
 from tqdm import tqdm
 # import evaluate
@@ -49,7 +50,7 @@ def normalize_zh_answer(s: str) -> str:
     return white_space_fix(remove_punc(lower(s)))
 
 
-def f1_score(prediction, ground_truth, **kwargs) -> tuple[float, float, float]:
+def f1_score(prediction, ground_truth, **kwargs) -> Tuple[float, float, float]:
     common = Counter(prediction) & Counter(ground_truth)
     num_same = sum(common.values())
     if num_same == 0:
@@ -79,7 +80,7 @@ def qa_f1_score(pred: str, ground_truths, **kwargs) -> float:
     return f1
 
 
-def qa_f1_score_zh(pred: str, ground_truths: list[str], **kwargs) -> float:
+def qa_f1_score_zh(pred: str, ground_truths: List[str], **kwargs) -> float:
     """
     QA F1 score for chinese.
     """
@@ -400,7 +401,7 @@ def get_score_one(pred: str, label: str, task_name: str) -> float:
     return float(score)
 
 
-def get_labels(preds: list) -> list[str]:
+def get_labels(preds: list) -> List[str]:
     possible_label_keys = ["ground_truth", "label"]
     for label_key in possible_label_keys:
         if label_key in preds[0]:
@@ -408,7 +409,7 @@ def get_labels(preds: list) -> list[str]:
     raise ValueError(f"Cannot find label in {preds[0]}")
 
 
-def get_preds(preds: list, data_name: str) -> list[str]:
+def get_preds(preds: list, data_name: str) -> List[str]:
     pred_strings = []
     possible_pred_keys = ["prediction", "pred"]
     for pred in preds:

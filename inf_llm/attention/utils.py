@@ -11,27 +11,3 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def get_mq_attn(flash_attn=False):
-
-    fattn = False
-
-    class UseTorch(Exception):
-        pass
-
-    try:
-        if flash_attn:
-            from ..mq_attn_triton import mq_attn_triton as mq_attn
-            fattn = True
-        else:
-            raise UseTorch
-
-    except Exception as E:
-        if not isinstance(E, UseTorch):
-            print("Load Triton Flash Attention Error.")
-
-        from ..mq_attn_torch import mq_attn_torch as mq_attn
-
-    return mq_attn, fattn
-

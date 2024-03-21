@@ -1,9 +1,10 @@
 import torch
-from .utils import repeat_kv, get_mq_attn
+from .utils import repeat_kv
+from .dot_production_attention import get_multi_stage_dot_production_attention
 
 
 def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
-    mq_attn, _ = get_mq_attn(fattn)
+    Attn, _ = get_multi_stage_dot_production_attention(fattn)
     def forward(self, query : torch.Tensor,
                     key_value : torch.Tensor,
                     position_bias : torch.Tensor,
@@ -69,15 +70,11 @@ def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
         local_h_q, local_h_k = position_bias(h_q_, h_k_)
         local_h_v = h_v_
 
-        dist = torch.arange(len_q, device=h_q.device).unsqueeze(1) - torch.arange(local_h_k.size(2), device=h_q.device).unsqueeze(0) + (local_h_k.size(2) - len_q)
-        local_mask = (dist >= 0) & (dist < n_local)
 
         if len_k > n_local:
             init_h_q = position_bias.apply_rotary_pos_emb_one_angle(
                 h_q, n_local + n_init
             )
-            dist = torch.arange(len_q, device=h_q.device).unsqueeze(1) - torch.arange(n_init, device=h_q.device).unsqueeze(0) + (len_k - len_q)
-            init_mask = (dist >= n_local)[:, :n_init].contiguous()
             init_h_k = position_bias.apply_rotary_pos_emb(
                 h_k[:, :, :n_init, :].contiguous(), 
                 n_init, n_init, position_bias._cos_cached, position_bias._sin_cached
@@ -91,11 +88,6 @@ def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
 
         else:
             init_h_q = h_q
-            init_mask = torch.empty(
-                (batch_size, num_heads, len_q, 0),
-                dtype=torch.bool,
-                device=h_q.device
-            )
             init_h_k = torch.empty(
                 (batch_size, num_heads, 0, dim_head),
                 device=h_k.device,
@@ -108,12 +100,14 @@ def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
             )
 
 
-
-        score = mq_attn(
-            local_h_q, local_h_k, local_h_v, local_mask,
-            init_h_q, init_h_k, init_h_v, init_mask,
-            sliding_window1=n_local
+        attn = Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
+        attn.append(local_h_q, local_h_k, local_h_v, sliding_window=n_local)
+        attn.append(
+            init_h_q, init_h_k, init_h_v, end=True,
+            sliding_window=(len_k - len_q, n_local),
+            complement_sliding_window=True
         )
+        score, _ = attn.get_result()
 
         score = score.view(batch_size, num_heads, len_q, dim_head).permute(0, 2, 1, 3) # (batch, len_q, num_heads, dim_head)
         score = score.reshape(batch_size, len_q, num_heads * dim_head) # (batch, len_q, num_heads * dim_head)

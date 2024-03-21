@@ -84,6 +84,10 @@ class MistralConv(Conversation):
         tokenized_prompt = self.tokenizer.apply_chat_template(self.messages, tokenize=True, add_generation_prompt=add_generation_prompt)
         return tokenized_prompt
         
+class QwenConv(Conversation):
+    def get_tokenized_prompt(self, add_generation_prompt):
+        tokenized_prompt = self.tokenizer.apply_chat_template(self.messages, tokenize=True, add_generation_prompt=add_generation_prompt)
+        return tokenized_prompt
 
 class VicunaConv(Conversation):
     def get_tokenized_prompt(self, add_generation_prompt):
@@ -102,7 +106,8 @@ class VicunaConv(Conversation):
 
 CONV = {
     "mistral-inst": MistralConv,
-    "vicuna": VicunaConv
+    "vicuna": VicunaConv,
+    "qwen": QwenConv
 }
 
 def chat(config):
