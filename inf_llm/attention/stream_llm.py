@@ -61,12 +61,6 @@ def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
             h_v_ = h_v_[:, :, h_v_.size(-2) - len_q - n_local:, :].contiguous().clone()
 
 
-        if num_heads != num_heads_kv:
-            assert num_heads % num_heads_kv == 0
-            num_group = num_heads // num_heads_kv
-            h_k_ = repeat_kv(h_k_, num_group)
-            h_v_ = repeat_kv(h_v_, num_group)
-
         local_h_q, local_h_k = position_bias(h_q_, h_k_)
         local_h_v = h_v_
 
@@ -80,21 +74,16 @@ def stream_llm_forward(n_local, n_init, fattn: bool = False, *args, **kwargs):
                 n_init, n_init, position_bias._cos_cached, position_bias._sin_cached
             )
             init_h_v = h_v[:, :, :n_init, :].contiguous()
-            if num_heads != num_heads_kv:
-                assert num_heads % num_heads_kv == 0
-                num_group = num_heads // num_heads_kv
-                init_h_k = repeat_kv(init_h_k, num_group)
-                init_h_v = repeat_kv(init_h_v, num_group)
 
         else:
             init_h_q = h_q
             init_h_k = torch.empty(
-                (batch_size, num_heads, 0, dim_head),
+                (batch_size, num_heads_kv, 0, dim_head),
                 device=h_k.device,
                 dtype=h_k.dtype
             )
             init_h_v = torch.empty(
-                (batch_size, num_heads, 0, dim_head),
+                (batch_size, num_heads_kv, 0, dim_head),
                 device=h_v.device,
                 dtype=h_v.dtype
             )

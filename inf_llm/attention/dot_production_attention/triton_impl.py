@@ -123,7 +123,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out, L,#
               stride_kz, stride_kh, stride_kn, stride_kk,  #
               stride_vz, stride_vh, stride_vk, stride_vn,  #
               stride_oz, stride_oh, stride_om, stride_on,  #
-              Z, H,  #
+              Z, H, H_KV, #
               N_CTX,  #
               ROUND_CTX,
               NKV_CTX,
@@ -144,9 +144,10 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out, L,#
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
+    off_hkv = off_h // (H//H_KV)
     q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
-    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    k_offset = off_z.to(tl.int64) * stride_kz + off_hkv.to(tl.int64) * stride_kh
+    v_offset = off_z.to(tl.int64) * stride_vz + off_hkv.to(tl.int64) * stride_vh
     o_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
 
     # block pointers
@@ -233,7 +234,7 @@ def _score_kernel(
     stride_qz, stride_qh, stride_qm, stride_qk,  #
     stride_kz, stride_kh, stride_kn, stride_kk,  #
     stride_oz, stride_oh, stride_on,
-    Z, H,  #
+    Z, H, H_KV, #
     N_CTX,  #
     ROUND_CTX,
     NKV_CTX,
@@ -251,8 +252,9 @@ def _score_kernel(
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
+    off_hkv = off_h // (H//H_KV)
     q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    k_offset = off_z.to(tl.int64) * stride_kz + off_hkv.to(tl.int64) * stride_kh
     m_ptrs = M + off_hz * ROUND_CTX + tl.arange(0, BLOCK_M)
     o = tl.zeros([BLOCK_M], dtype=tl.float32)
 
@@ -336,13 +338,12 @@ def get_score(q, k, m, sliding_window, complement_sliding_window):
     assert q.dim() == 4
     assert k.dim() == 4
     assert m.dim() == 3
-    assert q.shape[:2] == k.shape[:2]
     assert q.shape[:2] == m.shape[:2]
     N_CTX = q.size(-2)
     NKV_CTX = k.size(-2)
     ROUND_CTX = m.size(-1)
     ret = torch.zeros(
-        (k.size(0), k.size(1), k.size(2)),
+        (q.size(0), q.size(1), k.size(2)),
         dtype=k.dtype, device=k.device
     )
     if sliding_window is not None:
@@ -353,7 +354,7 @@ def get_score(q, k, m, sliding_window, complement_sliding_window):
     
     grid = lambda META: (
         triton.cdiv(k.shape[2], META["BLOCK_N"]),
-        k.shape[0] * k.shape[1]
+        q.shape[0] * q.shape[1]
     )
     sm_scale = 1 / math.sqrt(q.size(-1))
 
@@ -366,7 +367,7 @@ def get_score(q, k, m, sliding_window, complement_sliding_window):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             ret.stride(0), ret.stride(1), ret.stride(2),
-            q.size(0), q.size(1),
+            q.size(0), q.size(1), k.size(1),
             N_CTX, ROUND_CTX, NKV_CTX,
             sliding_window_offset,
             sliding_window_size,
@@ -386,7 +387,7 @@ def get_score(q, k, m, sliding_window, complement_sliding_window):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             ret.stride(0), ret.stride(1), ret.stride(2),
-            q.size(0), q.size(1),
+            q.size(0), q.size(1), k.size(1),
             N_CTX, ROUND_CTX, NKV_CTX,
             sliding_window_offset,
             sliding_window_size,
@@ -432,7 +433,7 @@ def _forward(
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
-            q.shape[0], q.shape[1],  #
+            q.shape[0], q.shape[1], k.shape[1], #
             q.shape[2],  #
             q_round_len,
             k.shape[2],
@@ -459,7 +460,7 @@ def _forward(
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
-            q.shape[0], q.shape[1],  #
+            q.shape[0], q.shape[1], k.shape[1], #
             q.shape[2],  #
             q_round_len,
             k.shape[2],
@@ -553,4 +554,3 @@ class TritonMultiStageDotProductionAttention(MultiStageDotProductionAttention):
         if end:
             assert not self.end 
             self.finalize()
-

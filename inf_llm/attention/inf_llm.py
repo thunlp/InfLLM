@@ -7,7 +7,6 @@ def inf_llm_forward(
     block_size, max_cached_block,
     exc_block_size, fattn,
     repr_topk: int = 1,
-    max_calc_block = None,
     cache_strategy="lru",
     score_decay=None,
     chunk_topk_calc=None,
@@ -47,7 +46,6 @@ def inf_llm_forward(
                 max_cached_block, topk,
                 exc_block_size,
                 score_decay, fattn, repr_topk,
-                max_calc_block,
                 cache_strategy,
                 chunk_topk_calc,
                 async_global_stream
@@ -74,4 +72,3 @@ def inf_llm_forward(
 
 
     return forward
-

@@ -15,12 +15,18 @@ def parse_args():
     parser.add_argument("--output_dir_path", required=True)
     parser.add_argument("--datasets", type=str, default=None)
     parser.add_argument("--model_center", action="store_true", default=False)
+    parser.add_argument("--rank", type=int, default=None)
+    parser.add_argument("--world_size", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true")
     args, extra_args = parser.parse_known_args()
     conf = OmegaConf.load(args.config_path)
     cli_conf = OmegaConf.from_cli(extra_args)
     conf = OmegaConf.merge(conf, cli_conf)
     conf.output_dir_path = args.output_dir_path
     conf.model.model_center = args.model_center
+    conf.rank = args.rank
+    conf.world_size = args.world_size
+    conf.verbose = args.verbose
     if not hasattr(conf.model, "tokenizer_path"):
         conf.model.tokenizer_path = conf.model.path
     if not hasattr(conf, "truncation"):
@@ -178,11 +184,24 @@ def load_infinite_bench(path, data_name) -> str:
         #     break
     return ret
 
+def post_process(pred, model_name):
+    if model_name == "qwen":
+        return pred.split("<|im_end|>")[0]
+    return pred
 
-
-def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset, model_name, gen_chunk_size = None, truncation: str = None):
+def get_pred(
+    model, tokenizer, data, max_length,
+    max_gen, prompt_format, dataset, model_name, 
+    gen_chunk_size = None, truncation: str = None, 
+    rank: int = None, world_size: int = None,
+    verbose: bool = False
+):
     preds = []
     data = list(data)
+
+    if world_size is not None:
+        data = data[rank::world_size]
+
     searcher = GreedySearch(model, tokenizer)
     cur = 0
     total = len(data)
@@ -206,14 +225,16 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
 
         if truncation is None:
             if len(tokenized_prompt) > max_length - max_gen:
-                print(f"Length {len(tokenized_prompt)}. Skipped.")
+                if verbose:
+                    print(f"Length {len(tokenized_prompt)}. Skipped.")
                 continue
 
         else:
             if truncation == "suffix":
                 length = len(tokenized_prompt)
                 if length > max_length - max_gen:
-                    print("over length")
+                    if verbose:
+                        print("over length")
                     init_token_num = 128
                     prompt = tokenizer.decode(tokenized_prompt[:init_token_num].tolist() + tokenized_prompt[- (max_length - max_gen - init_token_num):].tolist())
                     tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=add_special_tokens).input_ids[0]
@@ -238,15 +259,16 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
                 chunk_size=gen_chunk_size,
             )
 
-        pred = output[0]
+        pred = post_process(output[0], model_name)
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "token_length": len(tokenized_prompt) + max_gen})
         searcher.clear()
         cur += 1
-        print(f"----------{cur}/{total}----------")
-        print("Question:", prompt[-100:])
-        print("Pred:", pred)
-        print("Answer:", json_obj["answers"])
-        print("")
+        if verbose:
+            print(f"----------{cur}/{total}----------")
+            print("Question:", prompt[-100:])
+            print("Pred:", pred)
+            print("Answer:", json_obj["answers"])
+            print("")
 
 
     return preds
@@ -267,6 +289,12 @@ if __name__ == '__main__':
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("benchmark/config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("benchmark/config/dataset2maxlen.json", "r"))
+
+    
+    multiprocessing = args.world_size is not None and args.world_size > 1
+    if multiprocessing:
+        assert args.rank in list(range(args.world_size))
+
     # predict on each dataset
     for dataset in datasets:
         dname = dataset
@@ -295,8 +323,12 @@ if __name__ == '__main__':
             args.max_len, max_gen, 
             prompt_format, dataset, 
             args.conv_type, 
-            args.chunk_size, args.truncation
+            args.chunk_size, args.truncation,
+            args.rank, args.world_size,
+            args.verbose
         )
+        if multiprocessing:
+            out_path = out_path + f"_{args.rank}"
         with open(out_path, "w+", encoding="utf-8") as f:
             for pred in preds:
                 json.dump(pred, f, ensure_ascii=False)

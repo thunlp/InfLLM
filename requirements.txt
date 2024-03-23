@@ -3,6 +3,7 @@ transformers>=4.37.2
 fschat>=0.2.35
 datasets>=2.17.0
 omegaconf
+accelerate
 
 # flash-attn
 
