@@ -110,8 +110,11 @@ bash scripts/[infinitebench,longbench].sh
 ```
 
 ### Run a Chatbot with InfLLM
+
 ```
-bash scripts/chat.sh
+python -m inf_llm.chat \
+    --model-path mistralai/Mistral-7B-Instruct-v0.2 \
+    --inf-llm-config-path config/mistral-inf-llm.yaml
 ```
 
 ## Citation
