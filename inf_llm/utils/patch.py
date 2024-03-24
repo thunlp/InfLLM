@@ -77,6 +77,8 @@ def patch_hf(
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            if hasattr(self, "config") and hasattr(self.config, "scale_emb"):
+                inputs_embeds = inputs_embeds * self.config.scale_emb
 
         if use_cache:
             pkv = tuple()
@@ -139,6 +141,9 @@ def patch_hf(
     elif isinstance(model, Qwen2ForCausalLM):
         Attention = Qwen2Attention
         Model = Qwen2Model
+    elif model.__class__.__name__ == "MiniCPMForCausalLM":
+        Attention = model.model.layers[0].self_attn.__class__
+        Model = model.model.__class__
     else:
         raise ValueError("Only supports llama, mistral and qwen2 models.")
 

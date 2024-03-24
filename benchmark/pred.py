@@ -52,7 +52,7 @@ def get_model_and_tokenizer(config):
         bmt.load(model, os.path.join(config.path, "pytorch_model.pt"), strict=False)
         model = patch_model_center(model, config.type, **config)
     else:
-        model = AutoModelForCausalLM.from_pretrained(config.path).bfloat16().cuda()
+        model = AutoModelForCausalLM.from_pretrained(config.path, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="cuda")
         model = patch_hf(model, config.type, **config)
     return model, tokenizer
 
@@ -65,7 +65,7 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[0], prompt)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
-    elif model_name in ["mistral-inst", "qwen"]:
+    elif model_name in ["mistral-inst", "qwen", "minicpm"]:
         messages = [
             {
                 "role": "user",
