@@ -49,7 +49,8 @@ def inf_llm_forward(
                 score_decay, fattn, repr_topk,
                 cache_strategy,
                 chunk_topk_calc,
-                async_global_stream
+                async_global_stream,
+                faiss
             )
 
 
