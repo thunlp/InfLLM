@@ -98,22 +98,18 @@ class MemoryUnit:
 class VectorTensor:
     def __init__(
         self, 
-        element_shape,
-        element_dtype,
-        concat_dim,
+        hidden_size,
+        element_dtype
     ):
         init_cached_size = 16
-        if concat_dim != 0:
-            element_shape = (element_shape[concat_dim],) + element_shape[1:concat_dim] + (element_shape[0],)  + element_shape[concat_dim+1:]
-        init_data_shape = (init_cached_size,) + element_shape[1:]
-        self.concat_dim = concat_dim
         self.data = torch.empty(
-            init_data_shape,
+            (init_cached_size, hidden_size),
             dtype=element_dtype,
             device='cuda'
         )
         self.length = 0
         self.cache_size = init_cached_size
+        self.hidden_size = hidden_size
 
     def append_cache(self):
         new_cache_size = self.cache_size * 2
@@ -129,9 +125,8 @@ class VectorTensor:
 
     def append(self, tensor: torch.Tensor):
         assert tensor.dtype == self.data.dtype
+        assert tensor.size(1) == self.hidden_size
         assert tensor.is_contiguous()
-        if self.concat_dim != 0:
-            tensor = tensor.transpose(0, self.concat_dim)
 
         append_l = tensor.size(0)
 
@@ -144,11 +139,14 @@ class VectorTensor:
 
 
     def get_data(self):
-        if self.concat_dim == 0:
-            return self.data[:self.length, ...]
+        return self.data[:self.length, ...]
 
-        return self.data[:self.length,...].transpose(0, self.concat_dim)
 
+    def get_topk(self, tensor: torch.Tensor, topk): # inner product
+        assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
+        logits = torch.matmul(self.data[:self.length], tensor[:, None]).squeeze(dim=-1)
+        assert logits.dim() == 1 and logits.size(0) == self.length
+        return logits.topk(topk, dim=0).indices
 
     def __len__(self):
         return self.length
@@ -276,9 +274,9 @@ class ContextManager:
         self.cached_blocks = [{} for _ in range(self.num_units)] # [[block_id: block_score]
         self.num_global_block = 0
 
-        self.block_k = VectorTensor(
-            (self.num_units, self.unit_size, -1, dim_head), global_k.dtype, 2
-        )
+        self.block_k = [VectorTensor(
+            dim_head * self.unit_size, global_k.dtype
+        ) for _ in range(self.num_units)]
         self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)
         self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
 
@@ -322,27 +320,13 @@ class ContextManager:
             if self.num_global_block <= self.topk:
                 return [list(range(len(self.global_blocks[0]))) for _ in range(self.num_units)]
 
-            block_k = self.block_k.get_data()
-            assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
-
-            global_h_q = global_h_q.mean(dim=2, keepdim=True)
-            assert global_h_q.shape == (self.num_units, self.unit_size, 1, self.dim_head)
-
-            block_score = torch.matmul(
-                global_h_q, block_k.transpose(-1, -2)
-            ) # (num_units, unit_size, 1, num_global_block * repr_topk)
-
-            block_score = block_score.squeeze(dim=2)
-            block_score = block_score.mean(dim=1) 
-
-            assert block_score.shape == (self.num_units, self.num_global_block)
-            indices = block_score.topk(self.topk, dim=-1).indices.cpu()
-            assert indices.shape == (self.num_units, self.topk)
-
+            global_h_q = global_h_q.mean(dim=2, keepdim=False)
+            assert global_h_q.shape == (self.num_units, self.unit_size, self.dim_head)
+            global_h_q = global_h_q.reshape(self.num_units, self.dim_head * self.unit_size)
             ret = []
             for u in range(self.num_units):
-                ret.append(indices[u].tolist())
-        
+                ret.append(self.block_k[u].get_topk(global_h_q[u], self.topk).cpu().tolist())
+
         else:
             return self._cached_topk[self._topk_cur]
 
@@ -525,7 +509,6 @@ class ContextManager:
             return ret
 
 
-        global_q = self.flat_to_unit(global_q)
         global_h_q = global_q
         assert global_h_q.dim() == 4
         assert global_h_q.shape[:2] == (self.num_units, self.unit_size)
@@ -533,8 +516,9 @@ class ContextManager:
 
 
 
-        block_k = self.block_k.get_data()
-        assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
+        block_k = torch.cat([self.block_k[u].get_data()[None, :, :] for u in range(self.num_units)], dim=0)
+        assert block_k.shape == (self.num_units, self.num_global_block, self.dim_head * self.unit_size)
+        block_k = block_k.reshape(self.num_units, self.num_global_block, self.unit_size, self.dim_head).permute(0, 2, 1, 3).contiguous()
 
 
         if exc_block_num > 0:
@@ -628,10 +612,13 @@ class ContextManager:
                 self.global_remainder_local_score[:, :, global_remainder_st:global_remainder_st + self.block_size]
             )
             assert global_block_k.shape == (self.num_units, self.unit_size, self.repr_topk, self.dim_head)
-            global_block_k = global_block_k.mean(dim=-2, keepdim=True)
+            global_block_k = global_block_k.mean(dim=-2, keepdim=False)
+            global_block_k = global_block_k.reshape(self.num_units, self.unit_size * self.dim_head)
+            global_block_k = global_block_k[:, None, :]
 
             self.num_global_block += 1
-            self.block_k.append(global_block_k)
+            for u in range(self.num_units):
+                self.block_k[u].append(global_block_k[u])
             global_remainder_st += self.block_size
 
         self._global_remainder_ed = global_remainder_ed
