@@ -11,6 +11,7 @@ def inf_llm_forward(
     score_decay=None,
     chunk_topk_calc=None,
     async_global_stream=True,
+    pin_memory=False,
     faiss=False,
     *args, **kwargs
 ):
@@ -50,6 +51,7 @@ def inf_llm_forward(
                 cache_strategy,
                 chunk_topk_calc,
                 async_global_stream,
+                pin_memory,
                 faiss
             )
 
