@@ -1,5 +1,5 @@
 import torch
-from typing import Optional
+from typing import Optional, Tuple
 from copy import deepcopy
 from .dot_production_attention import get_multi_stage_dot_production_attention
 
@@ -27,18 +27,28 @@ class CudaCache:
 
 
 class MemoryUnit:
-    def __init__(self, data: torch.Tensor, cache: CudaCache, load_to_cache: bool = False):
+    def __init__(
+        self, 
+        kv: Tuple[torch.Tensor, torch.Tensor], 
+        cache: CudaCache, 
+        load_to_cache: bool = False, 
+        pin_memory: bool = False,
+    ):
         self.cache = cache
 
-        if data.is_cuda:
-            cpu_data = data.contiguous().to("cpu", non_blocking=True).pin_memory()
+        if kv[0].is_cuda:
+            cpu_data = tuple(_t.contiguous().to("cpu", non_blocking=True) for _t in kv)
         else:
-            cpu_data = data.contiguous().pin_memory()
+            cpu_data = tuple(_t.contiguous() for _t in kv)
+
+        if pin_memory:
+            cpu_data = tuple(_t.pin_memory() for _t in cpu_data)
 
         if load_to_cache:
             gpu_data, gpu_data_id = cache.alloc()
-            gpu_data = gpu_data.view(data.shape)
-            gpu_data.copy_(data, non_blocking=True)
+            gpu_data = gpu_data.view((2,) + kv[0].shape)
+            gpu_data[0].copy_(kv[0], non_blocking=True)
+            gpu_data[1].copy_(kv[1], non_blocking=True)
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream())
         else:
@@ -50,10 +60,11 @@ class MemoryUnit:
         self.gpu_data_id = gpu_data_id
         self.event = event
 
-    def load(self, target: Optional[torch.Tensor] = None) -> bool:
+    def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> bool:
         if self.gpu_data is not None:
             if target is not None:
-                target.copy_(self.gpu_data, non_blocking=True)
+                target[0].copy_(self.gpu_data[0], non_blocking=True)
+                target[1].copy_(self.gpu_data[1], non_blocking=True)
                 target_event = torch.cuda.Event()
                 target_event.record(torch.cuda.current_stream())
             else:
@@ -63,15 +74,18 @@ class MemoryUnit:
             return False, target_event
 
         gpu_data, gpu_data_id = self.cache.alloc()
-        gpu_data = gpu_data.view(self.cpu_data.shape)
+        gpu_data = gpu_data.view((2,) + self.cpu_data[0].shape)
         if target is not None:
-            target.copy_(self.cpu_data, non_blocking=True)
+            target[0].copy_(self.cpu_data[0], non_blocking=True)
+            target[1].copy_(self.cpu_data[1], non_blocking=True)
             target_event = torch.cuda.Event()
             target_event.record(torch.cuda.current_stream())
-            gpu_data.copy_(target, non_blocking=True)
+            gpu_data[0].copy_(target[0], non_blocking=True)
+            gpu_data[1].copy_(target[1], non_blocking=True)
 
         else:
-            gpu_data.copy_(self.cpu_data, non_blocking=True)
+            gpu_data[0].copy_(self.cpu_data[0], non_blocking=True)
+            gpu_data[1].copy_(self.cpu_data[1], non_blocking=True)
 
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
@@ -189,6 +203,7 @@ class ContextManager:
                  cache_strategy = "lru",
                  chunk_topk_calc: Optional[int] = None,
                  async_global_stream: bool = True,
+                 pin_memory: bool = False,
                  faiss: bool = False
     ):
 
@@ -210,6 +225,7 @@ class ContextManager:
         self.load_count = 0
         self.chunk_topk_calc = chunk_topk_calc
         self.async_global_stream = async_global_stream
+        self.pin_memory = pin_memory
         self.faiss = faiss
 
         global GLOBAL_STREAM
@@ -239,8 +255,7 @@ class ContextManager:
         for i in range(len(lst)):
             idx = lst[i][0]
             if ignore_blocks is None or (idx not in ignore_blocks):
-                self.global_blocks[u][idx][0].offload()
-                self.global_blocks[u][idx][1].offload()
+                self.global_blocks[u][idx].offload()
                 self.cached_blocks[u].pop(idx)
                 removed += 1
 
@@ -297,7 +312,7 @@ class ContextManager:
         self.unit_size = num_heads
         self.unit_size_kv = num_heads_kv
 
-        self.global_blocks = [[] for _ in range(self.num_units)] # [[(global_k, global_v)]]
+        self.global_blocks = [[] for _ in range(self.num_units)] # [[memory_unit]]
         self.cached_blocks = [{} for _ in range(self.num_units)] # [[block_id: block_score]
         self.num_global_block = 0
 
@@ -338,8 +353,8 @@ class ContextManager:
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
         self.cuda_cache = CudaCache(
-            self.max_cached_block * self.num_units * 2,
-            self.unit_size_kv * self.block_size * dim_head,
+            self.max_cached_block * self.num_units,
+            self.unit_size_kv * self.block_size * dim_head * 2,
             local_k.dtype
         )
 
@@ -399,8 +414,7 @@ class ContextManager:
 
                 
                 assert b_idx in self.cached_blocks[u]
-                self.global_blocks[u][b_idx][0].load(global_h_k[u, :, st:ed, :])
-                self.global_blocks[u][b_idx][1].load(global_h_v[u, :, st:ed, :])
+                self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
 
              
         init_st = block_num * self.block_size
@@ -634,10 +648,15 @@ class ContextManager:
             global_remainder_len -= self.block_size
             for u in range(self.num_units):
                 self.global_blocks[u].append((
-                    MemoryUnit(self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
-                               self.cuda_cache, False),
-                    MemoryUnit(self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
-                               self.cuda_cache, False),
+                    MemoryUnit(
+                        (
+                            self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
+                            self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :]
+                        ),
+                        self.cuda_cache,
+                        False,
+                        self.pin_memory
+                    )
                 ))
 
             global_block_k = self.get_block_k(
