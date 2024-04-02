@@ -146,10 +146,35 @@ class VectorTensor:
         assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
         logits = torch.matmul(self.data[:self.length], tensor[:, None]).squeeze(dim=-1)
         assert logits.dim() == 1 and logits.size(0) == self.length
-        return logits.topk(topk, dim=0).indices
+        return logits.topk(topk, dim=0).indices.cpu().tolist()
 
     def __len__(self):
         return self.length
+
+
+class Faiss:
+    def __init__(self, hidden_size, element_dtype):
+        import faiss
+        # We use the CPU index here because the GPU index requires a long initialization time
+        self.index = faiss.IndexFlatIP(hidden_size)
+        self.hidden_size = hidden_size
+
+    def append(self, tensor: torch.Tensor):
+        assert tensor.dim() == 2 and tensor.size(1) == self.hidden_size
+        self.index.add(tensor.cpu().float().numpy().astype("float32"))
+
+    def get_data(self):
+        raise ValueError
+
+    def get_topk(self, tensor: torch.Tensor, topk):
+        assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
+        xq = tensor[None, :].cpu().float().numpy().astype("float32")
+        topk_index = self.index.search(xq, topk)[1][0].tolist()
+        return topk_index
+
+    def __len__(self):
+        return self.index.ntotal
+
 
 GLOBAL_STREAM = None
 
@@ -163,7 +188,8 @@ class ContextManager:
                  repr_topk: int = 1,
                  cache_strategy = "lru",
                  chunk_topk_calc: Optional[int] = None,
-                 async_global_stream: bool = True
+                 async_global_stream: bool = True,
+                 faiss: bool = False
     ):
 
         self.length = 0
@@ -184,6 +210,7 @@ class ContextManager:
         self.load_count = 0
         self.chunk_topk_calc = chunk_topk_calc
         self.async_global_stream = async_global_stream
+        self.faiss = faiss
 
         global GLOBAL_STREAM
         if self.async_global_stream and GLOBAL_STREAM is None:
@@ -274,9 +301,15 @@ class ContextManager:
         self.cached_blocks = [{} for _ in range(self.num_units)] # [[block_id: block_score]
         self.num_global_block = 0
 
-        self.block_k = [VectorTensor(
-            dim_head * self.unit_size, global_k.dtype
-        ) for _ in range(self.num_units)]
+        if self.faiss:
+            self.block_k = [Faiss(
+                dim_head * self.unit_size, global_k.dtype
+            ) for _ in range(self.num_units)]
+        else:
+            self.block_k = [VectorTensor(
+                dim_head * self.unit_size, global_k.dtype
+            ) for _ in range(self.num_units)]
+
         self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)
         self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
 
@@ -325,7 +358,7 @@ class ContextManager:
             global_h_q = global_h_q.reshape(self.num_units, self.dim_head * self.unit_size)
             ret = []
             for u in range(self.num_units):
-                ret.append(self.block_k[u].get_topk(global_h_q[u], self.topk).cpu().tolist())
+                ret.append(self.block_k[u].get_topk(global_h_q[u], self.topk))
 
         else:
             return self._cached_topk[self._topk_cur]

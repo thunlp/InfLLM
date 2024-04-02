@@ -11,6 +11,7 @@ def inf_llm_forward(
     score_decay=None,
     chunk_topk_calc=None,
     async_global_stream=True,
+    faiss=False,
     *args, **kwargs
 ):
 
