@@ -684,6 +684,25 @@ class ContextManager:
         local_q, local_k, local_v,
         global_q, global_k, global_v,
     ):
+        batch_size = local_q.size(0)
+        input_length = local_q.size(-2)
+
+        if self.perhead:
+            num_heads = local_q.size(1)
+            num_heads_kv = local_v.size(1)
+            def repeat_kv(t):
+                t = t.view(batch_size, num_heads_kv, 1, input_length, -1)
+                t = t.expand(batch_size, num_heads_kv, num_heads // num_heads_kv, input_length,  -1)
+                t = t.reshape(batch_size * num_heads, 1, input_length, -1)
+                return t
+
+            local_q = local_q.view(batch_size * num_heads, 1, input_length, -1)
+            local_k = repeat_kv(local_k)
+            local_v = repeat_kv(local_v)
+            global_q = global_q.view(batch_size * num_heads , 1, input_length, -1)
+            global_k = repeat_kv(global_k)
+            global_v = repeat_kv(global_v)
+
         if not self.initialized:
             self.init(
                 local_q, local_k, local_v,
@@ -786,8 +805,12 @@ class ContextManager:
             )
             self.global_remainder_local_score = self.global_remainder_local_score[:, :, self._global_remainder_st:]
 
-        return torch.cat(o_list, dim=-2)
+        ret = torch.cat(o_list, dim=-2)
 
+        if self.perhead:
+            ret = ret.view(batch_size, num_heads, input_length, -1)
+
+        return ret
 
     def size(self, *args, **kwargs):
         return self.length
