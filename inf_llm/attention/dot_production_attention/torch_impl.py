@@ -47,6 +47,16 @@ class TorchMultiStageDotProductionAttention(MultiStageDotProductionAttention):
         len_q = q.size(-2)
         len_k = k.size(-2)
 
+        num_heads = q.size(1)
+        num_heads_kv = k.size(1)
+        if num_heads != num_heads_kv:
+            shape = list(k.shape)
+            num_group = num_heads // num_heads_kv
+            k = k[:, :, None, :, :].expand(shape[0], shape[1], num_group, shape[2], shape[3])
+            k = k.reshape(shape[0], num_heads, shape[2], shape[3])
+            v = v[:, :, None, :, :].expand(shape[0], shape[1], num_group, shape[2], shape[3])
+            v = v.reshape(shape[0], num_heads, shape[2], shape[3])
+
         if sliding_window is None:
             mask = torch.ones(
                 (len_q, len_k),
