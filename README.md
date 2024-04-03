@@ -2,16 +2,16 @@
 
 The code of our paper "InfLLM: Unveiling the Intrinsic Capacity of LLMs for Understanding Extremely Long Sequences with Training-Free Memory" [[pdf]](https://arxiv.org/pdf/2402.04617.pdf).
 
+## Updates
+  - **March 3, 2024**: Initial code release. See [init](https://github.com/thunlp/InfLLM/tree/init).
+  - **March 24, 2024**: Refactor the code. Improve inference speed and reduce GPU memory usage.
+  - **April 4, 2024**: Supports topk retrieval using [faiss](https://github.com/facebookresearch/faiss).
+
 ## Quick Links
 * [Overview](#overview)
 * [Requirements](#requirements)
 * [Usage](#usage)
 * [Citation](#citation)
-
-## Updates
-  - **March 3, 2024**: Initial code release. See [init](https://github.com/thunlp/InfLLM/tree/init).
-  - **March 24, 2024**: Refactor the code. Improve inference speed and reduce GPU memory usage.
-  - **April 4, 2024**: Supports topk retrieval using [faiss](https://github.com/facebookresearch/faiss).
 
 ## Overview
 
