@@ -762,7 +762,9 @@ class ContextManager:
             # append global
             with torch.cuda.stream(GLOBAL_STREAM):
                 self.append_global(ed - st, kv_ed - kv_st, local_score)
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+
+            if self.async_global_stream:
+                torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
             if use_chunk_topk:
                 self._topk_cur += 1
