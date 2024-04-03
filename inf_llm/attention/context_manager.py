@@ -202,9 +202,10 @@ class ContextManager:
                  repr_topk: int = 1,
                  cache_strategy = "lru",
                  chunk_topk_calc: Optional[int] = None,
-                 async_global_stream: bool = True,
+                 async_global_stream: bool = False,
                  pin_memory: bool = False,
-                 faiss: bool = False
+                 faiss: bool = False,
+                 perhead: bool = False
     ):
 
         self.length = 0
@@ -227,6 +228,7 @@ class ContextManager:
         self.async_global_stream = async_global_stream
         self.pin_memory = pin_memory
         self.faiss = faiss
+        self.perhead = perhead
 
         global GLOBAL_STREAM
         if self.async_global_stream and GLOBAL_STREAM is None:
