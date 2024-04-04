@@ -2,12 +2,16 @@
 
 The code of our paper "InfLLM: Unveiling the Intrinsic Capacity of LLMs for Understanding Extremely Long Sequences with Training-Free Memory" [[pdf]](https://arxiv.org/pdf/2402.04617.pdf).
 
+## Updates
+  - **March 3, 2024**: Initial code release. See [init](https://github.com/thunlp/InfLLM/tree/init).
+  - **March 24, 2024**: Refactor the code. Improve inference speed and reduce GPU memory usage.
+  - **April 4, 2024**: Supports topk retrieval using [faiss](https://github.com/facebookresearch/faiss).
+
 ## Quick Links
 * [Overview](#overview)
 * [Requirements](#requirements)
 * [Usage](#usage)
 * [Citation](#citation)
-
 
 ## Overview
 
@@ -48,8 +52,8 @@ model:
   path: mistralai/Mistral-7B-Instruct-v0.2 
 
   # Use flash-attention or not. 
-  # For inf-llm/infinite-lm/stream-llm, we implemented multi-stage flash-attention by OpenAI's triton.
-  fattn: true 
+  # For inf-llm/infinite-lm/stream-llm, we implemented multi-stage flash-attention by OpenAI's Triton.
+  fattn: false 
   
   # RoPE base and distance_scale
   base: 1000000
@@ -82,16 +86,31 @@ model:
   # score_decay for LRU-S
   # score_decay: 0.1
 
+  # Use overlap local and global calculation.
+  # Can accelerate, but may not be compatible.
+  async_global_stream: false
+
+  # Use faiss for topk retrieval of memory units. 
+  # It will increase inference time and ensure constant GPU memory usage.
+  faiss: false 
+
+  # Use perhead topk. 
+  # Enabling it will be very time-consuming and is intended for research use only.
+  # perhead: false
+
 # Model max input length.
 # A truncation will be employed if the input length exceeds.
 max_len: 2147483647
 
+# truncation type. Now supports suffix only.
+truncation: suffix
+
 # Chunked input in decoding.
-# To save GPU memory.
+# To save GPU memory. (FFN block)
 chunk_size: 8192
 
 # Conversation type. 
-# mistral/vicuna
+# mistral/vicuna/qwen/minicpm
 conv_type: mistral
 ```
 
@@ -110,6 +129,8 @@ bash scripts/[infinitebench,longbench].sh
 ```
 
 ### Run a Chatbot with InfLLM
+
+We integrated fastchat's CLI chat.
 
 ```
 python -m inf_llm.chat \

@@ -1,5 +1,5 @@
 import torch
-from typing import Optional
+from typing import Optional, Tuple
 from copy import deepcopy
 from .dot_production_attention import get_multi_stage_dot_production_attention
 
@@ -27,18 +27,28 @@ class CudaCache:
 
 
 class MemoryUnit:
-    def __init__(self, data: torch.Tensor, cache: CudaCache, load_to_cache: bool = False):
+    def __init__(
+        self, 
+        kv: Tuple[torch.Tensor, torch.Tensor], 
+        cache: CudaCache, 
+        load_to_cache: bool = False, 
+        pin_memory: bool = False,
+    ):
         self.cache = cache
 
-        if data.is_cuda:
-            cpu_data = data.contiguous().to("cpu", non_blocking=True).pin_memory()
+        if kv[0].is_cuda:
+            cpu_data = tuple(_t.contiguous().to("cpu", non_blocking=True) for _t in kv)
         else:
-            cpu_data = data.contiguous().pin_memory()
+            cpu_data = tuple(_t.contiguous() for _t in kv)
+
+        if pin_memory:
+            cpu_data = tuple(_t.pin_memory() for _t in cpu_data)
 
         if load_to_cache:
             gpu_data, gpu_data_id = cache.alloc()
-            gpu_data = gpu_data.view(data.shape)
-            gpu_data.copy_(data, non_blocking=True)
+            gpu_data = gpu_data.view((2,) + kv[0].shape)
+            gpu_data[0].copy_(kv[0], non_blocking=True)
+            gpu_data[1].copy_(kv[1], non_blocking=True)
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream())
         else:
@@ -50,10 +60,11 @@ class MemoryUnit:
         self.gpu_data_id = gpu_data_id
         self.event = event
 
-    def load(self, target: Optional[torch.Tensor] = None) -> bool:
+    def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> bool:
         if self.gpu_data is not None:
             if target is not None:
-                target.copy_(self.gpu_data, non_blocking=True)
+                target[0].copy_(self.gpu_data[0], non_blocking=True)
+                target[1].copy_(self.gpu_data[1], non_blocking=True)
                 target_event = torch.cuda.Event()
                 target_event.record(torch.cuda.current_stream())
             else:
@@ -63,15 +74,18 @@ class MemoryUnit:
             return False, target_event
 
         gpu_data, gpu_data_id = self.cache.alloc()
-        gpu_data = gpu_data.view(self.cpu_data.shape)
+        gpu_data = gpu_data.view((2,) + self.cpu_data[0].shape)
         if target is not None:
-            target.copy_(self.cpu_data, non_blocking=True)
+            target[0].copy_(self.cpu_data[0], non_blocking=True)
+            target[1].copy_(self.cpu_data[1], non_blocking=True)
             target_event = torch.cuda.Event()
             target_event.record(torch.cuda.current_stream())
-            gpu_data.copy_(target, non_blocking=True)
+            gpu_data[0].copy_(target[0], non_blocking=True)
+            gpu_data[1].copy_(target[1], non_blocking=True)
 
         else:
-            gpu_data.copy_(self.cpu_data, non_blocking=True)
+            gpu_data[0].copy_(self.cpu_data[0], non_blocking=True)
+            gpu_data[1].copy_(self.cpu_data[1], non_blocking=True)
 
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
@@ -98,22 +112,18 @@ class MemoryUnit:
 class VectorTensor:
     def __init__(
         self, 
-        element_shape,
-        element_dtype,
-        concat_dim,
+        hidden_size,
+        element_dtype
     ):
         init_cached_size = 16
-        if concat_dim != 0:
-            element_shape = (element_shape[concat_dim],) + element_shape[1:concat_dim] + (element_shape[0],)  + element_shape[concat_dim+1:]
-        init_data_shape = (init_cached_size,) + element_shape[1:]
-        self.concat_dim = concat_dim
         self.data = torch.empty(
-            init_data_shape,
+            (init_cached_size, hidden_size),
             dtype=element_dtype,
             device='cuda'
         )
         self.length = 0
         self.cache_size = init_cached_size
+        self.hidden_size = hidden_size
 
     def append_cache(self):
         new_cache_size = self.cache_size * 2
@@ -129,9 +139,8 @@ class VectorTensor:
 
     def append(self, tensor: torch.Tensor):
         assert tensor.dtype == self.data.dtype
+        assert tensor.size(1) == self.hidden_size
         assert tensor.is_contiguous()
-        if self.concat_dim != 0:
-            tensor = tensor.transpose(0, self.concat_dim)
 
         append_l = tensor.size(0)
 
@@ -144,14 +153,42 @@ class VectorTensor:
 
 
     def get_data(self):
-        if self.concat_dim == 0:
-            return self.data[:self.length, ...]
+        return self.data[:self.length, ...]
 
-        return self.data[:self.length,...].transpose(0, self.concat_dim)
 
+    def get_topk(self, tensor: torch.Tensor, topk): # inner product
+        assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
+        logits = torch.matmul(self.data[:self.length], tensor[:, None]).squeeze(dim=-1)
+        assert logits.dim() == 1 and logits.size(0) == self.length
+        return logits.topk(topk, dim=0).indices.cpu().tolist()
 
     def __len__(self):
         return self.length
+
+
+class Faiss:
+    def __init__(self, hidden_size, element_dtype):
+        import faiss
+        # We use the CPU index here because the GPU index requires a long initialization time
+        self.index = faiss.IndexFlatIP(hidden_size)
+        self.hidden_size = hidden_size
+
+    def append(self, tensor: torch.Tensor):
+        assert tensor.dim() == 2 and tensor.size(1) == self.hidden_size
+        self.index.add(tensor.cpu().float().numpy().astype("float32"))
+
+    def get_data(self):
+        raise ValueError
+
+    def get_topk(self, tensor: torch.Tensor, topk):
+        assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
+        xq = tensor[None, :].cpu().float().numpy().astype("float32")
+        topk_index = self.index.search(xq, topk)[1][0].tolist()
+        return topk_index
+
+    def __len__(self):
+        return self.index.ntotal
+
 
 GLOBAL_STREAM = None
 
@@ -165,7 +202,10 @@ class ContextManager:
                  repr_topk: int = 1,
                  cache_strategy = "lru",
                  chunk_topk_calc: Optional[int] = None,
-                 async_global_stream: bool = True
+                 async_global_stream: bool = False,
+                 pin_memory: bool = False,
+                 faiss: bool = False,
+                 perhead: bool = False
     ):
 
         self.length = 0
@@ -186,6 +226,9 @@ class ContextManager:
         self.load_count = 0
         self.chunk_topk_calc = chunk_topk_calc
         self.async_global_stream = async_global_stream
+        self.pin_memory = pin_memory
+        self.faiss = faiss
+        self.perhead = perhead
 
         global GLOBAL_STREAM
         if self.async_global_stream and GLOBAL_STREAM is None:
@@ -214,8 +257,7 @@ class ContextManager:
         for i in range(len(lst)):
             idx = lst[i][0]
             if ignore_blocks is None or (idx not in ignore_blocks):
-                self.global_blocks[u][idx][0].offload()
-                self.global_blocks[u][idx][1].offload()
+                self.global_blocks[u][idx].offload()
                 self.cached_blocks[u].pop(idx)
                 removed += 1
 
@@ -272,13 +314,19 @@ class ContextManager:
         self.unit_size = num_heads
         self.unit_size_kv = num_heads_kv
 
-        self.global_blocks = [[] for _ in range(self.num_units)] # [[(global_k, global_v)]]
+        self.global_blocks = [[] for _ in range(self.num_units)] # [[memory_unit]]
         self.cached_blocks = [{} for _ in range(self.num_units)] # [[block_id: block_score]
         self.num_global_block = 0
 
-        self.block_k = VectorTensor(
-            (self.num_units, self.unit_size, -1, dim_head), global_k.dtype, 2
-        )
+        if self.faiss:
+            self.block_k = [Faiss(
+                dim_head * self.unit_size, global_k.dtype
+            ) for _ in range(self.num_units)]
+        else:
+            self.block_k = [VectorTensor(
+                dim_head * self.unit_size, global_k.dtype
+            ) for _ in range(self.num_units)]
+
         self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)
         self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
 
@@ -307,8 +355,8 @@ class ContextManager:
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
         self.cuda_cache = CudaCache(
-            self.max_cached_block * self.num_units * 2,
-            self.unit_size_kv * self.block_size * dim_head,
+            self.max_cached_block * self.num_units,
+            self.unit_size_kv * self.block_size * dim_head * 2,
             local_k.dtype
         )
 
@@ -322,27 +370,13 @@ class ContextManager:
             if self.num_global_block <= self.topk:
                 return [list(range(len(self.global_blocks[0]))) for _ in range(self.num_units)]
 
-            block_k = self.block_k.get_data()
-            assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
-
-            global_h_q = global_h_q.mean(dim=2, keepdim=True)
-            assert global_h_q.shape == (self.num_units, self.unit_size, 1, self.dim_head)
-
-            block_score = torch.matmul(
-                global_h_q, block_k.transpose(-1, -2)
-            ) # (num_units, unit_size, 1, num_global_block * repr_topk)
-
-            block_score = block_score.squeeze(dim=2)
-            block_score = block_score.mean(dim=1) 
-
-            assert block_score.shape == (self.num_units, self.num_global_block)
-            indices = block_score.topk(self.topk, dim=-1).indices.cpu()
-            assert indices.shape == (self.num_units, self.topk)
-
+            global_h_q = global_h_q.mean(dim=2, keepdim=False)
+            assert global_h_q.shape == (self.num_units, self.unit_size, self.dim_head)
+            global_h_q = global_h_q.reshape(self.num_units, self.dim_head * self.unit_size)
             ret = []
             for u in range(self.num_units):
-                ret.append(indices[u].tolist())
-        
+                ret.append(self.block_k[u].get_topk(global_h_q[u], self.topk))
+
         else:
             return self._cached_topk[self._topk_cur]
 
@@ -382,8 +416,7 @@ class ContextManager:
 
                 
                 assert b_idx in self.cached_blocks[u]
-                self.global_blocks[u][b_idx][0].load(global_h_k[u, :, st:ed, :])
-                self.global_blocks[u][b_idx][1].load(global_h_v[u, :, st:ed, :])
+                self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
 
              
         init_st = block_num * self.block_size
@@ -525,7 +558,6 @@ class ContextManager:
             return ret
 
 
-        global_q = self.flat_to_unit(global_q)
         global_h_q = global_q
         assert global_h_q.dim() == 4
         assert global_h_q.shape[:2] == (self.num_units, self.unit_size)
@@ -533,8 +565,9 @@ class ContextManager:
 
 
 
-        block_k = self.block_k.get_data()
-        assert block_k.shape == (self.num_units, self.unit_size, self.num_global_block, self.dim_head)
+        block_k = torch.cat([self.block_k[u].get_data()[None, :, :] for u in range(self.num_units)], dim=0)
+        assert block_k.shape == (self.num_units, self.num_global_block, self.dim_head * self.unit_size)
+        block_k = block_k.reshape(self.num_units, self.num_global_block, self.unit_size, self.dim_head).permute(0, 2, 1, 3).contiguous()
 
 
         if exc_block_num > 0:
@@ -617,10 +650,15 @@ class ContextManager:
             global_remainder_len -= self.block_size
             for u in range(self.num_units):
                 self.global_blocks[u].append((
-                    MemoryUnit(self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
-                               self.cuda_cache, False),
-                    MemoryUnit(self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
-                               self.cuda_cache, False),
+                    MemoryUnit(
+                        (
+                            self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
+                            self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :]
+                        ),
+                        self.cuda_cache,
+                        False,
+                        self.pin_memory
+                    )
                 ))
 
             global_block_k = self.get_block_k(
@@ -628,10 +666,13 @@ class ContextManager:
                 self.global_remainder_local_score[:, :, global_remainder_st:global_remainder_st + self.block_size]
             )
             assert global_block_k.shape == (self.num_units, self.unit_size, self.repr_topk, self.dim_head)
-            global_block_k = global_block_k.mean(dim=-2, keepdim=True)
+            global_block_k = global_block_k.mean(dim=-2, keepdim=False)
+            global_block_k = global_block_k.reshape(self.num_units, self.unit_size * self.dim_head)
+            global_block_k = global_block_k[:, None, :]
 
             self.num_global_block += 1
-            self.block_k.append(global_block_k)
+            for u in range(self.num_units):
+                self.block_k[u].append(global_block_k[u])
             global_remainder_st += self.block_size
 
         self._global_remainder_ed = global_remainder_ed
@@ -643,6 +684,25 @@ class ContextManager:
         local_q, local_k, local_v,
         global_q, global_k, global_v,
     ):
+        batch_size = local_q.size(0)
+        input_length = local_q.size(-2)
+
+        if self.perhead:
+            num_heads = local_q.size(1)
+            num_heads_kv = local_v.size(1)
+            def repeat_kv(t):
+                t = t.view(batch_size, num_heads_kv, 1, input_length, -1)
+                t = t.expand(batch_size, num_heads_kv, num_heads // num_heads_kv, input_length,  -1)
+                t = t.reshape(batch_size * num_heads, 1, input_length, -1)
+                return t
+
+            local_q = local_q.view(batch_size * num_heads, 1, input_length, -1)
+            local_k = repeat_kv(local_k)
+            local_v = repeat_kv(local_v)
+            global_q = global_q.view(batch_size * num_heads , 1, input_length, -1)
+            global_k = repeat_kv(global_k)
+            global_v = repeat_kv(global_v)
+
         if not self.initialized:
             self.init(
                 local_q, local_k, local_v,
@@ -723,7 +783,9 @@ class ContextManager:
             # append global
             with torch.cuda.stream(GLOBAL_STREAM):
                 self.append_global(ed - st, kv_ed - kv_st, local_score)
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+
+            if self.async_global_stream:
+                torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
             if use_chunk_topk:
                 self._topk_cur += 1
@@ -743,8 +805,12 @@ class ContextManager:
             )
             self.global_remainder_local_score = self.global_remainder_local_score[:, :, self._global_remainder_st:]
 
-        return torch.cat(o_list, dim=-2)
+        ret = torch.cat(o_list, dim=-2)
 
+        if self.perhead:
+            ret = ret.view(batch_size, num_heads, input_length, -1)
+
+        return ret
 
     def size(self, *args, **kwargs):
         return self.length
