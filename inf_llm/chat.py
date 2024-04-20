@@ -561,7 +561,11 @@ def main(args):
 
     if args.inf_llm_config_path is not None:
         from omegaconf import OmegaConf
-        inf_llm_config = OmegaConf.load(args.inf_llm_config_path)["model"]
+        inf_llm_config = OmegaConf.load(args.inf_llm_config_path)
+        if inf_llm_config.conv_type == "llama-3-inst":
+            args.conv_template = "llama-3-inst"
+
+        inf_llm_config = inf_llm_config["model"]
     else:
         inf_llm_config = None
 
