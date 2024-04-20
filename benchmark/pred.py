@@ -65,7 +65,7 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[0], prompt)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
-    elif model_name in ["mistral-inst", "qwen", "minicpm"]:
+    elif model_name in ["mistral-inst", "qwen", "minicpm", "llama-3-inst"]:
         messages = [
             {
                 "role": "user",
@@ -209,6 +209,16 @@ def get_pred(
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
 
+        extra_end_token_ids = []
+        if model_name == "llama-3-inst":
+            extra_end_token_ids.append(tokenizer.encode("<|eot_id|>", add_special_tokens=False)[0])
+
+        if model_name == "qwen":
+            extra_end_token_ids.append(tokenizer.encode("<|im_end|>", add_special_tokens=False)[0])
+
+        if dataset == "samsum":
+            extra_end_token_ids.append(tokenizer.encode("\n", add_special_tokens=False)[-1])
+
         if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
             # chat models are better off without build prompts on these tasks
             prompt = build_chat(tokenizer, prompt, model_name)
@@ -243,21 +253,12 @@ def get_pred(
     
 
         
-        if dataset == "samsum":
-            output = searcher.generate(
-                input_ids = tokenized_prompt,
-                max_length=max_gen,
-                extra_end_token_ids=[
-                    tokenizer.encode("\n", add_special_tokens=False)[-1],
-                ],
-                chunk_size=gen_chunk_size,
-            )
-        else:
-            output = searcher.generate(
-                input_ids = tokenized_prompt,
-                max_length=max_gen,
-                chunk_size=gen_chunk_size,
-            )
+        output = searcher.generate(
+            input_ids = tokenized_prompt,
+            max_length=max_gen,
+            chunk_size=gen_chunk_size,
+            extra_end_token_ids=extra_end_token_ids
+        )
 
         pred = post_process(output[0], model_name)
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "token_length": len(tokenized_prompt) + max_gen})
@@ -265,6 +266,7 @@ def get_pred(
         cur += 1
         if verbose:
             print(f"----------{cur}/{total}----------")
+            print("Length: ", len(tokenized_prompt))
             print("Question:", prompt[-100:])
             print("Pred:", pred)
             print("Answer:", json_obj["answers"])

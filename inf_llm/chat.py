@@ -621,6 +621,51 @@ def main(args):
     except KeyboardInterrupt:
         print("exit...")
 
+from fastchat.conversation import Conversation, register_conv_template, SeparatorStyle
+import dataclasses
+
+@dataclasses.dataclass
+class Llama3Conv(Conversation):
+    # role format
+    role_format: str = "{role}"
+
+    def get_prompt(self) -> str:
+        system_prompt = self.system_template.format(system_message=self.system_message)
+        ret = system_prompt
+        for role, message in self.messages:
+            if message:
+                ret += self.role_format.format(role=role) + message + self.sep
+            else:
+                ret += self.role_format.format(role=role)
+        return ret
+    
+    def copy(self):
+        return Llama3Conv(
+            name=self.name,
+            system_template=self.system_template,
+            system_message=self.system_message,
+            roles=self.roles,
+            messages=[[x, y] for x, y in self.messages],
+            offset=self.offset,
+            sep_style=self.sep_style,
+            sep=self.sep,
+            sep2=self.sep2,
+            stop_str=self.stop_str,
+            stop_token_ids=self.stop_token_ids,
+            role_format=self.role_format
+        )
+
+register_conv_template(
+    Llama3Conv(
+        "llama-3-inst",
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="<|eot_id|>",
+        role_format="<|start_header_id|>{role}<|end_header_id|>\n\n",
+        stop_token_ids=[128009, 128001]
+    )
+)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

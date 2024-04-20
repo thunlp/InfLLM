@@ -56,6 +56,8 @@ def patch_hf(
         output_attentions = None,
         output_hidden_states = None,
         return_dict = None,
+        *args,
+        **kwargs
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -133,14 +135,14 @@ def patch_hf(
     forward = huggingface_forward(ATTN_FORWRAD[attn_type](**attn_kwargs))
 
     if isinstance(model, LlamaForCausalLM):
-        Attention = LlamaAttention
-        Model = LlamaModel
+        Attention = model.model.layers[0].self_attn.__class__
+        Model = model.model.__class__
     elif isinstance(model, MistralForCausalLM):
-        Attention = MistralAttention
-        Model = MistralModel
+        Attention = model.model.layers[0].self_attn.__class__
+        Model = model.model.__class__
     elif isinstance(model, Qwen2ForCausalLM):
-        Attention = Qwen2Attention
-        Model = Qwen2Model
+        Attention = model.model.layers[0].self_attn.__class__
+        Model = model.model.__class__
     elif model.__class__.__name__ == "MiniCPMForCausalLM":
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__

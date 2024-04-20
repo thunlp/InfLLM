@@ -6,6 +6,7 @@ The code of our paper "InfLLM: Unveiling the Intrinsic Capacity of LLMs for Unde
   - **March 3, 2024**: Initial code release. See [init](https://github.com/thunlp/InfLLM/tree/init).
   - **March 24, 2024**: Refactor the code. Improve inference speed and reduce GPU memory usage.
   - **April 4, 2024**: Supports topk retrieval using [faiss](https://github.com/facebookresearch/faiss).
+  - **April 20, 2024**: Added support for LLaMA 3.
 
 ## Quick Links
 * [Overview](#overview)
@@ -110,8 +111,8 @@ truncation: suffix
 chunk_size: 8192
 
 # Conversation type. 
-# mistral/vicuna/qwen/minicpm
-conv_type: mistral
+# mistral-inst/vicuna/qwen/minicpm/llama-3-inst
+conv_type: mistral-inst
 ```
 
 ### Evaluation
