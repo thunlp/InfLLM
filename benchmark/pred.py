@@ -184,9 +184,13 @@ def load_infinite_bench(path, data_name) -> str:
         #     break
     return ret
 
-def post_process(pred, model_name):
+def post_process(pred, model_name, dataset):
     if model_name == "qwen":
-        return pred.split("<|im_end|>")[0]
+        pred = pred.split("<|im_end|>")[0]
+
+    if dataset == "samsum":
+        pred = pred.split("\n")[0].strip()
+
     return pred
 
 def get_pred(
@@ -260,7 +264,7 @@ def get_pred(
             extra_end_token_ids=extra_end_token_ids
         )
 
-        pred = post_process(output[0], model_name)
+        pred = post_process(output[0], model_name, dataset)
         preds.append({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "token_length": len(tokenized_prompt) + max_gen})
         searcher.clear()
         cur += 1
